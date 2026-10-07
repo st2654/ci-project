@@ -205,3 +205,233 @@ def test_diff_excludes_gitignored_files(cloned: GitRepo, fake_remote: FakeRemote
     (Path(cloned.path) / "debug.log").write_text("noise\n")
     d = cloned.diff(fake_remote.main_sha)
     assert "debug.log" not in d.replace(".gitignore", "")
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint / rollback / changed_files
+# --------------------------------------------------------------------------- #
+
+
+def _log(repo: GitRepo) -> list[str]:
+    return git("log", "--format=%s|%an|%ae", cwd=repo.path).splitlines()
+
+
+def test_changed_files_clean_tree(cloned: GitRepo) -> None:
+    assert cloned.changed_files() == []
+
+
+def test_changed_files_new_modified_deleted(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    (root / "app.py").unlink()
+    (root / "z_new.py").write_text("x = 1\n")
+    (root / "pkg").mkdir()
+    (root / "pkg" / "a.py").write_text("y = 2\n")
+    assert cloned.changed_files() == ["app.py", "pkg/a.py", "z_new.py"]
+    git("checkout", "-q", "HEAD", "--", "app.py", cwd=root)
+    (root / "app.py").write_text("changed\n")
+    assert cloned.changed_files() == ["app.py", "pkg/a.py", "z_new.py"]
+
+
+def test_changed_files_ignores_gitignored(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    (root / ".git" / "info" / "exclude").write_text("*.log\n")
+    (root / "debug.log").write_text("noise\n")
+    assert cloned.changed_files() == []
+
+
+def test_checkpoint_commits_all_changes(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    before = cloned.head_sha()
+    (root / "app.py").write_text("changed\n")
+    (root / "new.py").write_text("n = 1\n")
+    sha = cloned.checkpoint("ci-fix: fix t (attempt 1)")
+    assert sha is not None and sha == cloned.head_sha() != before
+    assert cloned.is_clean()
+    assert _log(cloned)[0] == "ci-fix: fix t (attempt 1)|ci-fix|ci-fix@localhost"
+    assert git("show", "--name-only", "--format=", "HEAD", cwd=root).split() == [
+        "app.py",
+        "new.py",
+    ]
+
+
+def test_checkpoint_without_changes_returns_none(cloned: GitRepo) -> None:
+    before = cloned.head_sha()
+    assert cloned.checkpoint("nothing") is None
+    assert cloned.head_sha() == before
+
+
+def test_checkpoint_after_diff_intent_to_add(cloned: GitRepo, fake_remote: FakeRemote) -> None:
+    (Path(cloned.path) / "new.py").write_text("n = 1\n")
+    cloned.diff(fake_remote.main_sha)  # leaves an intent-to-add entry in the index
+    assert cloned.checkpoint("with new file") is not None
+    assert "new.py" in git("show", "--name-only", "--format=", "HEAD", cwd=cloned.path)
+
+
+def test_checkpoint_skips_hooks(cloned: GitRepo) -> None:
+    hook = Path(cloned.path) / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    (Path(cloned.path) / "app.py").write_text("changed\n")
+    assert cloned.checkpoint("hooks skipped") is not None
+
+
+def test_rollback_restores_head_and_removes_new_files(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    original = (root / "app.py").read_text()
+    (root / "app.py").write_text("changed\n")
+    (root / "new.py").write_text("n = 1\n")
+    (root / "newdir").mkdir()
+    (root / "newdir" / "f.py").write_text("")
+    cloned.diff("HEAD")  # intent-to-add entries must not survive a rollback either
+    cloned.rollback()
+    assert (root / "app.py").read_text() == original
+    assert not (root / "new.py").exists()
+    assert not (root / "newdir").exists()
+    assert cloned.is_clean()
+
+
+def test_rollback_restores_deleted_file_and_keeps_ignored(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    (root / ".git" / "info" / "exclude").write_text("*.log\n")
+    (root / "keep.log").write_text("ignored\n")
+    (root / "app.py").unlink()
+    cloned.rollback()
+    assert (root / "app.py").is_file()
+    assert (root / "keep.log").read_text() == "ignored\n"
+
+
+def test_rollback_keeps_checkpoints(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    (root / "app.py").write_text("accepted\n")
+    sha = cloned.checkpoint("accepted")
+    (root / "app.py").write_text("rejected\n")
+    cloned.rollback()
+    assert cloned.head_sha() == sha
+    assert (root / "app.py").read_text() == "accepted\n"
+
+
+# --------------------------------------------------------------------------- #
+# untrusted checkout: hooks, fsmonitor and secrets
+# --------------------------------------------------------------------------- #
+
+_HOOK_NAMES = (
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "reference-transaction",
+)
+
+
+def _plant_hooks(hooks_dir: Path, marker: Path) -> None:
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for name in _HOOK_NAMES:
+        hook = hooks_dir / name
+        hook.write_text(f"#!/bin/sh\necho {name} >> '{marker}'\nenv >> '{marker}'\nexit 0\n")
+        hook.chmod(0o755)
+
+
+def _change_and_checkpoint(repo: GitRepo) -> None:
+    (Path(repo.path) / "app.py").write_text("changed\n")
+    assert repo.checkpoint("checkpoint") is not None
+    (Path(repo.path) / "app.py").write_text("again\n")
+    repo.changed_files()
+    repo.rollback()
+
+
+def test_planted_repo_hooks_never_run(cloned: GitRepo, tmp_path: Path) -> None:
+    marker = tmp_path / "hook-ran"
+    _plant_hooks(Path(cloned.path) / ".git" / "hooks", marker)
+    _change_and_checkpoint(cloned)
+    assert not marker.exists()
+
+
+def test_planted_hooks_path_in_repo_config_is_ignored(cloned: GitRepo, tmp_path: Path) -> None:
+    marker = tmp_path / "hook-ran"
+    _plant_hooks(tmp_path / "evil-hooks", marker)
+    git("config", "core.hooksPath", str(tmp_path / "evil-hooks"), cwd=cloned.path)
+    _change_and_checkpoint(cloned)
+    assert not marker.exists()
+
+
+def test_user_global_hooks_path_is_ignored(
+    cloned: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "hook-ran"
+    _plant_hooks(tmp_path / "global-hooks", marker)
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text(f"[core]\n\thooksPath = {tmp_path / 'global-hooks'}\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    _change_and_checkpoint(cloned)
+    assert not marker.exists()
+
+
+def test_planted_fsmonitor_never_runs(cloned: GitRepo, tmp_path: Path) -> None:
+    marker = tmp_path / "fsmonitor-ran"
+    script = tmp_path / "fsmonitor.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    script.chmod(0o755)
+    git("config", "core.fsmonitor", str(script), cwd=cloned.path)
+    cloned.is_clean()
+    _change_and_checkpoint(cloned)
+    assert not marker.exists()
+
+
+def test_git_subprocess_env_has_no_secrets(
+    cloned: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Anything git spawns (a hook, if one ever ran) inherits this env.
+    secrets = {
+        "GITHUB_TOKEN": "gh-secret-123",
+        "ANTHROPIC_API_KEY": "sk-secret-456",
+        "CI_FIX_GITHUB_TOKEN": "cfx-secret-789",
+        "PYTHONPATH": "/evil/path",
+    }
+    for key, value in secrets.items():
+        monkeypatch.setenv(key, value)
+    env_dump = run_git(["-c", "alias.dumpenv=!env", "dumpenv"], cwd=cloned.path)
+    for key, value in secrets.items():
+        assert key not in env_dump
+        assert value not in env_dump
+    assert "PATH=" in env_dump  # the rest of the environment is kept
+
+
+# --------------------------------------------------------------------------- #
+# untracked artifacts: untracked_files / exclude
+# --------------------------------------------------------------------------- #
+
+
+def test_untracked_files_lists_files_inside_new_dirs(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    (root / "pkg.egg-info").mkdir()
+    (root / "pkg.egg-info" / "PKG-INFO").write_text("x")
+    (root / ".coverage").write_text("x")
+    (root / "app.py").write_text("tracked change\n")
+    assert cloned.untracked_files() == {".coverage", "pkg.egg-info/PKG-INFO"}
+
+
+def test_exclude_hides_exact_paths_only(cloned: GitRepo) -> None:
+    root = Path(cloned.path)
+    for name in ("a*b.txt", "aXb.txt", "[x].txt", "x.txt"):
+        (root / name).write_text("x")
+    (root / "sub").mkdir()
+    (root / "sub" / "a*b.txt").write_text("x")
+    cloned.exclude(["a*b.txt", "[x].txt"])
+    assert cloned.untracked_files() == {"aXb.txt", "x.txt", "sub/a*b.txt"}
+    assert cloned.changed_files() == ["aXb.txt", "sub/a*b.txt", "x.txt"]
+
+
+def test_exclude_untracked_keeps_artifacts_through_checkpoint_and_rollback(
+    cloned: GitRepo,
+) -> None:
+    root = Path(cloned.path)
+    (root / ".git" / "info" / "exclude").write_text("# existing, no trailing newline")
+    (root / ".coverage").write_text("x")
+    assert cloned.exclude_untracked() == [".coverage"]
+    assert cloned.changed_files() == []
+    assert cloned.checkpoint("nothing") is None
+    (root / "app.py").write_text("changed\n")
+    cloned.rollback()
+    assert (root / ".coverage").is_file()
+    exclude = (root / ".git" / "info" / "exclude").read_text()
+    assert exclude.splitlines()[-1] == "/.coverage"

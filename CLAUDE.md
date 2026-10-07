@@ -35,8 +35,8 @@ opens a PR with a concise, human-readable description.
 | What a fix may change | Test files **and** source code. A source change must fix the real bug, never special-case the test (see "Integrity rules"). |
 | Delivery | Push patch branch `ci-fix/pr-<N>` and **open a PR targeting the original PR's branch** (the fix layers on top of that PR) |
 | Fork PRs | If the PR comes from a fork: push the fix to the fork's branch **only when** `maintainer_can_modify` is true and the token has access; otherwise skip the push/PR and return the fix as a diff with a clear message. |
-| Execution | Run tests **locally** (Docker postponed). Each PR gets its own workspace `<workspace_dir>/<owner>__<repo>__pr-<N>/` with `repo/`, `venv/` (separate uv venv) and `reports/`; it is **deleted at the end of the run** unless `keep_workspace = true`. |
-| Target-repo isolation | PR code runs with an **allowlisted environment**: its own venv, no `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`/`PYTHON*`/`CI_FIX_*`. Timeouts kill the whole process group. |
+| Execution | Run tests **locally** (Docker postponed). Each run gets its own workspace `<workspace_dir>/<owner>__<repo>__pr-<N>__<YYYYmmdd-HHMMSS>-<6 hex>/` (unique, so concurrent runs on the same PR never collide) with `repo/`, `venv/` (separate uv venv) and `reports/`; it is **deleted at the end of the run** unless `keep_workspace = true`. |
+| Target-repo isolation | PR code runs with an **allowlisted environment**: its own venv, no `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`/`PYTHON*`/`CI_FIX_*`. Timeouts kill the whole process group. PR tests can write to `.git`, so every git call runs with hooks and fsmonitor disabled (`-c core.hooksPath=/dev/null -c core.fsmonitor=false`) and without those secret env vars. |
 | Test names | Full pytest node ids are used as given; bare names (`test_a`, `Cls::test_a`) are resolved via `pytest --collect-only`. Ambiguous or unknown names are reported, never guessed. |
 | Fix attempts | **3** fix → re-test rounds per test, then report it as unfixable |
 | Regression runs | Run the **full test suite** **only if the fix changed source code** (non-test files). Test-only fixes re-run just the target tests. |
@@ -68,31 +68,53 @@ CLI equivalent: `ci-fix --repo <url> --pr <n> --tests <id> [<id> ...]`
 ## Pipeline (LangGraph)
 
 ```
-setup_repo ─► run_tests ─► triage ─► fix ─► verify ─┬─► regression? ─► finalize
-                                       ▲            │
-                                       └── failing & attempts < 3
+setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► select_next ─┬─► finalize
+                                                               ▲        │ (pending empty)
+                                                               │        ▼
+                                                          verify_one ◄─ fix_one
+                                            (fix_one skips verify when the attempt is
+                                             rejected early or the fixer gives up)
 ```
 
 1. **setup_repo** — Clone the repo, fetch `pull/<N>/head`, create branch
-   `ci-fix/pr-<N>` from it.
-2. **run_tests** — Run only the given tests with pytest, write results as JUnit
-   XML, and parse that file (never scrape the console). Record the failure
-   message and traceback for each test. If a test the user named already passes,
-   report it as such and don't touch it.
-3. **triage** — Decide **parallel vs sequential**:
-   - Parallel only if the failures are independent (no overlapping files in
-     their tracebacks) and the suite tolerates isolated runs.
-   - Otherwise run fixes one after another.
-4. **fix** — One Claude agent per failing test (temperature 0) with tools:
-   `read_file`, `search_code`, `edit_file`, `run_test`. Parallel fixes run in
-   separate git worktrees (LangGraph `Send` fan-out); patches are merged
-   afterwards. If two patches conflict, redo those fixes sequentially.
-5. **verify** — Re-run the target tests. Failures loop back to **fix** until
-   the 3-attempt limit is reached.
-6. **regression** — Only if any non-test file changed: run the regression
-   suite. A new failure counts as a failed fix attempt.
-7. **finalize** — Commit with a descriptive message, push the branch, open
-   the PR with the summary, and return `FixResult`.
+   `ci-fix/pr-<N>` from it. A failure part-way removes the half-made workspace.
+2. **setup_env / resolve_tests** — Create the test venv; resolve bare names to node ids.
+3. **run_initial** — Run all requested tests with pytest, write results as JUnit
+   XML, and parse that file (never scrape the console). Tests that already pass
+   are reported as such and not touched; failing ones become `pending`.
+4. **Fix one test at a time** (in the order the user gave them) — *checkpoint &
+   rollback*. Slice 7 adds a triage step: fix in parallel (separate worktrees,
+   LangGraph `Send`) only when failures are independent (no overlapping files in
+   their tracebacks); conflicting patches are redone sequentially.
+   - **fix_one** calls the fixer for the next pending test. What changed is read
+     from git, not from the fixer's claim. No change, or a fixer error, is a
+     rejected attempt; a fixer that reports *unfixable* has its edits rolled back.
+   - **verify_one** re-runs **all** requested tests, not just the target. The
+     attempt is accepted only if the target now passes and nothing that passed
+     before broke, disappeared (deleted/renamed) or became skipped.
+   - **Flaky tests:** if the only problem is previously passing tests now failing,
+     those are re-run once and the attempt is rejected only if they still fail.
+     A test that seems fixed as a side effect is re-run once before it counts.
+     *Limitation:* one re-run only catches occasional flakiness; a test that fails
+     often, or the target itself passing by luck, can still give a wrong verdict.
+   - **Artifacts:** untracked files left by env setup, the initial run and each
+     verify run (`*.egg-info`, `.coverage`, …) are added to `.git/info/exclude`,
+     so they are never committed, never in the diff and never deleted by rollback.
+     The fixer's own new files are captured right after it returns.
+   - **Accepted** attempts become a local **checkpoint commit**
+     (`ci-fix: fix <id> (attempt <n>)`). Other pending tests that now pass are
+     marked FIXED ("fixed by the fix for <id>") without calling the fixer.
+   - **Rejected** attempts are **rolled back** (`reset --hard` + `clean -fd`), and
+     the rejection reason is passed to the next attempt. After `max_attempts`
+     (default 3) the test is UNFIXABLE with the last reason.
+5. **regression** (slice 6) — Only if any non-test file changed: run the
+   regression suite. A new failure counts as a failed fix attempt.
+6. **finalize** — The diff against the PR head contains **only accepted fixes**
+   (the checkpoint commits). Slice 8 squashes the checkpoints into one commit with
+   a descriptive message, pushes the branch, opens the PR and returns `FixResult`.
+
+Per-run handles (workspace, test runner) live in a `RunContext` passed through the
+LangGraph config; `PipelineDeps` is immutable, so one `deps` can serve concurrent runs.
 
 ---
 

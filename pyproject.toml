@@ -5,6 +5,7 @@ description = "Fix failing tests on a GitHub pull request with an LLM agent."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "langgraph>=1.2.14",
     "pydantic>=2",
     "pygithub>=2.10.0",
 ]

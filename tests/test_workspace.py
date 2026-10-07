@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -12,6 +13,8 @@ from ci_fix.config import Settings
 from ci_fix.tools.git import GitError
 from ci_fix.tools.github import GitHubError, RepoRef
 from ci_fix.workspace import PreparedRepo, prepare_pr_checkout
+
+RUN_DIR_RE = re.compile(r"octo__repo__pr-7__\d{8}-\d{6}-[0-9a-f]{6}")
 
 
 @pytest.fixture
@@ -29,9 +32,10 @@ def test_prepare_happy_path(fake_remote: FakeRemote, settings: Settings) -> None
         RepoRef(owner="octo", name="repo"), fake_remote.pr_number
     )
 
-    run_dir = settings.workspace_dir / f"octo__repo__pr-{fake_remote.pr_number}"
+    run_dir = Path(prepared.run_dir)
+    assert run_dir.parent == settings.workspace_dir
+    assert RUN_DIR_RE.fullmatch(run_dir.name), run_dir.name
     expected = run_dir / "repo"
-    assert Path(prepared.run_dir) == run_dir
     assert Path(prepared.path) == expected
     assert prepared.repo == RepoRef(owner="octo", name="repo")
     assert prepared.pr == pr_info(fake_remote)
@@ -57,35 +61,21 @@ def test_prepare_uses_branch_prefix(fake_remote: FakeRemote, tmp_path: Path) -> 
     assert git("symbolic-ref", "HEAD", cwd=Path(prepared.path)) == f"refs/heads/{prepared.branch}"
 
 
-def test_prepare_rerun_replaces_existing_dest(fake_remote: FakeRemote, settings: Settings) -> None:
+def test_each_run_gets_a_fresh_run_dir(fake_remote: FakeRemote, settings: Settings) -> None:
     client = fake_client(pr_info(fake_remote))
     first = prepare_pr_checkout(
         REPO_URL, fake_remote.pr_number, settings, client, clone_url=fake_remote.url
     )
-    stale = Path(first.path) / "stale.txt"
-    stale.write_text("leftover")
+    marker = Path(first.path) / "first-run.txt"
+    marker.write_text("still here")
 
     second = prepare_pr_checkout(
         REPO_URL, fake_remote.pr_number, settings, client, clone_url=fake_remote.url
     )
-    assert Path(second.path) == Path(first.path)
-    assert not stale.exists()
+    assert Path(second.run_dir) != Path(first.run_dir)
+    assert RUN_DIR_RE.fullmatch(Path(second.run_dir).name)
+    assert marker.read_text() == "still here"  # the other run's workspace is left alone
     assert git("rev-parse", "HEAD", cwd=Path(second.path)) == fake_remote.pr_sha
-
-
-def test_prepare_rerun_over_non_git_dir(fake_remote: FakeRemote, settings: Settings) -> None:
-    dest = settings.workspace_dir / f"octo__repo__pr-{fake_remote.pr_number}"
-    dest.mkdir(parents=True)
-    (dest / "junk.txt").write_text("junk")
-    prepared = prepare_pr_checkout(
-        REPO_URL,
-        fake_remote.pr_number,
-        settings,
-        fake_client(pr_info(fake_remote)),
-        clone_url=fake_remote.url,
-    )
-    assert Path(prepared.run_dir) == dest
-    assert not (dest / "junk.txt").exists()
 
 
 @pytest.mark.parametrize("state", ["closed", "merged"])
@@ -100,7 +90,7 @@ def test_prepare_rejects_non_open_pr(
             fake_client(pr_info(fake_remote, state=state)),
             clone_url=fake_remote.url,
         )
-    assert not (settings.workspace_dir / f"octo__repo__pr-{fake_remote.pr_number}").exists()
+    assert _run_dirs(settings) == []
 
 
 def test_prepare_rejects_sha_mismatch(fake_remote: FakeRemote, settings: Settings) -> None:
@@ -153,3 +143,57 @@ def test_prepared_current_branch_not_ambiguous(fake_remote: FakeRemote, settings
         clone_url=fake_remote.url,
     )
     assert GitRepo(Path(prepared.path)).current_branch() == prepared.branch
+
+
+def _run_dirs(settings: Settings) -> list[Path]:
+    root = settings.workspace_dir
+    return sorted(root.iterdir()) if root.exists() else []
+
+
+def test_prepare_fetch_failure_removes_run_dir(fake_remote: FakeRemote, settings: Settings) -> None:
+    info = pr_info(fake_remote).model_copy(update={"number": 99})
+    with pytest.raises(GitError):
+        prepare_pr_checkout(REPO_URL, 99, settings, fake_client(info), clone_url=fake_remote.url)
+    assert _run_dirs(settings) == []
+
+
+def test_prepare_sha_mismatch_removes_run_dir(fake_remote: FakeRemote, settings: Settings) -> None:
+    client = fake_client(pr_info(fake_remote, head_sha=fake_remote.main_sha))
+    with pytest.raises(GitError, match="PR head moved"):
+        prepare_pr_checkout(
+            REPO_URL, fake_remote.pr_number, settings, client, clone_url=fake_remote.url
+        )
+    assert _run_dirs(settings) == []
+
+
+def test_prepare_clone_failure_removes_run_dir(fake_remote: FakeRemote, settings: Settings) -> None:
+    client = fake_client(pr_info(fake_remote))
+    with pytest.raises(GitError):
+        prepare_pr_checkout(
+            REPO_URL,
+            fake_remote.pr_number,
+            settings,
+            client,
+            clone_url=str(settings.workspace_dir.parent / "missing.git"),
+        )
+    assert _run_dirs(settings) == []
+
+
+def test_prepare_interrupt_removes_run_dir(
+    fake_remote: FakeRemote, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ci_fix.tools.git import GitRepo
+
+    def interrupted(self, pr_number, token=None):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(GitRepo, "fetch_pr", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        prepare_pr_checkout(
+            REPO_URL,
+            fake_remote.pr_number,
+            settings,
+            fake_client(pr_info(fake_remote)),
+            clone_url=fake_remote.url,
+        )
+    assert _run_dirs(settings) == []

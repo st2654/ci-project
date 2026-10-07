@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from ci_fix.logging_setup import get_logger
@@ -16,6 +16,21 @@ log = get_logger(__name__)
 
 _GITHUB_AUTH_HEADER_KEY = "http.https://github.com/.extraheader"
 _REDACTED = "***"
+# Passed to every git call. The checkout runs untrusted PR code (its tests) before we run git
+# in it, so planted hooks or an fsmonitor command must never execute.
+_SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+# Never handed to git (or anything it might spawn); auth goes via GIT_CONFIG_* instead.
+_SECRET_ENV_KEYS = frozenset({"ANTHROPIC_API_KEY", "GITHUB_TOKEN"})
+_SECRET_ENV_PREFIXES = ("CI_FIX_", "PYTHON")
+# Identity for local checkpoint commits, so they work without a configured git user.
+_COMMIT_CONFIG = (
+    "-c",
+    "user.name=ci-fix",
+    "-c",
+    "user.email=ci-fix@localhost",
+    "-c",
+    "commit.gpgsign=false",
+)
 
 
 class GitError(Exception):
@@ -34,6 +49,7 @@ def _redact(text: str, token: str | None) -> str:
     return text
 
 
+_GLOB_SPECIAL_RE = re.compile(r"([\\*?\[])")
 _URL_CREDENTIALS_RE = re.compile(r"(://)[^/@\s]+@")
 
 
@@ -43,7 +59,11 @@ def _safe_url(url: str) -> str:
 
 
 def _git_env(token: str | None) -> dict[str, str]:
-    env = dict(os.environ)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _SECRET_ENV_KEYS and not k.startswith(_SECRET_ENV_PREFIXES)
+    }
     env["GIT_TERMINAL_PROMPT"] = "0"
     if token:
         # Auth goes through env-scoped config so the token never lands in argv or .git/config.
@@ -60,8 +80,10 @@ def run_git(
     timeout: float = 600,
 ) -> str:
     """Run ``git *args`` and return stdout without the trailing newline."""
-    argv = ["git", *args]
-    log.debug("$ %s (cwd=%s)", _safe_url(_redact(" ".join(argv), token)), cwd or ".")
+    argv = ["git", *_SAFE_CONFIG, *args]
+    # The fixed _SAFE_CONFIG flags are left out of the log line for readability.
+    shown = " ".join(["git", *args])
+    log.debug("$ %s (cwd=%s)", _safe_url(_redact(shown, token)), cwd or ".")
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -151,3 +173,65 @@ class GitRepo:
         """
         self._git("add", "--all", "--intent-to-add")
         return self._git("diff", base)
+
+    def changed_files(self) -> list[str]:
+        """Sorted paths that differ between the working tree and HEAD (new, modified, deleted).
+
+        Gitignored files are not included.
+        """
+        self._git("add", "--all", "--intent-to-add")
+        return sorted(set(self._git("diff", "--name-only", "HEAD").splitlines()))
+
+    def checkpoint(self, message: str) -> str | None:
+        """Commit every change in the working tree; return the new HEAD, or None if unchanged.
+
+        Hooks are skipped (``--no-verify``): these are local bookkeeping commits.
+        """
+        self._git("add", "--all")
+        if not self._git("diff", "--cached", "--name-only"):
+            log.debug("Checkpoint skipped: nothing to commit")
+            return None
+        self._git(*_COMMIT_CONFIG, "commit", "--no-verify", "-q", "-m", message)
+        sha = self.head_sha()
+        log.debug("Checkpoint %s: %s", sha[:12], message)
+        return sha
+
+    def rollback(self) -> None:
+        """Discard all uncommitted changes and untracked files (gitignored files are kept)."""
+        self._git("reset", "--hard", "-q", "HEAD")
+        self._git("clean", "-fdq")
+        log.debug("Rolled back working tree to %s", self.head_sha()[:12])
+
+    def untracked_files(self) -> set[str]:
+        """Untracked, non-ignored files (one entry per file, also inside untracked dirs)."""
+        out = self._git("ls-files", "--others", "--exclude-standard", "-z")
+        return {p for p in out.split("\0") if p}
+
+    def exclude(self, paths: Iterable[str]) -> None:
+        """Ignore ``paths`` locally via ``.git/info/exclude`` (never committed or cleaned).
+
+        Used for build/test artifacts (``*.egg-info``, ``.coverage``, …) in repos without a
+        matching ``.gitignore``, so they never end up in a fix.
+        """
+        paths = sorted(set(paths))
+        if not paths:
+            return
+        exclude_file = Path(self._git("rev-parse", "--git-path", "info/exclude"))
+        if not exclude_file.is_absolute():
+            exclude_file = self.path / exclude_file
+        exclude_file.parent.mkdir(parents=True, exist_ok=True)
+        # Anchored, glob characters escaped: each line matches exactly one path.
+        escaped = (_GLOB_SPECIAL_RE.sub(r"\\\1", p) for p in paths)
+        lines = "".join(f"/{p}\n" for p in escaped)
+        existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+        if existing and not existing.endswith("\n"):
+            lines = "\n" + lines
+        with exclude_file.open("a", encoding="utf-8") as fh:
+            fh.write(lines)
+        log.debug("Excluded %d untracked artifact(s): %s", len(paths), ", ".join(paths[:10]))
+
+    def exclude_untracked(self) -> list[str]:
+        """Exclude every currently untracked file; return what was excluded."""
+        paths = sorted(self.untracked_files())
+        self.exclude(paths)
+        return paths

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import shutil
 import time
 from pathlib import Path
@@ -55,6 +56,12 @@ def _require_inside_workspace(path: Path, settings: Settings) -> Path:
     return target
 
 
+def run_dir_name(ref: RepoRef, pr_number: int) -> str:
+    """``<owner>__<repo>__pr-<N>__<YYYYmmdd-HHMMSS>-<6 hex>``: unique per run."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{ref.owner}__{ref.name}__pr-{pr_number}__{stamp}-{secrets.token_hex(3)}"
+
+
 def prepare_pr_checkout(
     repo_url: str,
     pr_number: int,
@@ -73,30 +80,33 @@ def prepare_pr_checkout(
     if pr.state != "open":
         raise GitHubError(f"PR {ref.full_name}#{pr_number} is {pr.state}, expected open")
 
-    run_dir = settings.workspace_dir / f"{ref.owner}__{ref.name}__pr-{pr_number}"
-    if run_dir.exists():
-        target = _require_inside_workspace(run_dir, settings)
-        log.info("Removing previous workspace %s", run_dir)
-        shutil.rmtree(target)  # the workspace directory is owned by ci-fix
-    run_dir.mkdir(parents=True)
+    run_dir = settings.workspace_dir / run_dir_name(ref, pr_number)
+    _require_inside_workspace(run_dir, settings)
+    run_dir.mkdir(parents=True)  # unique per run, so concurrent runs never share it
     (run_dir / "reports").mkdir()
     dest = run_dir / "repo"
 
     token = settings.github_token.get_secret_value() if settings.github_token else None
-    log.info("[setup 2/4] Cloning %s", ref.full_name)
-    step = time.monotonic()
-    repo = GitRepo.clone(clone_url or ref.clone_url, dest, token=token)
-    log.info("[setup 2/4] Cloned in %.1fs", time.monotonic() - step)
-
-    log.info("[setup 3/4] Fetching PR head")
-    sha = repo.fetch_pr(pr_number, token=token)
-    if sha != pr.head_sha:
-        raise GitError(f"PR head moved: API says {pr.head_sha}, fetched {sha} — retry")
-    log.info("[setup 3/4] PR head is %s", sha[:12])
-
     branch = f"{settings.branch_prefix}{pr_number}"
-    log.info("[setup 4/4] Creating patch branch %s", branch)
-    repo.create_branch(branch, sha)
+    try:
+        log.info("[setup 2/4] Cloning %s", ref.full_name)
+        step = time.monotonic()
+        repo = GitRepo.clone(clone_url or ref.clone_url, dest, token=token)
+        log.info("[setup 2/4] Cloned in %.1fs", time.monotonic() - step)
+
+        log.info("[setup 3/4] Fetching PR head")
+        sha = repo.fetch_pr(pr_number, token=token)
+        if sha != pr.head_sha:
+            raise GitError(f"PR head moved: API says {pr.head_sha}, fetched {sha} — retry")
+        log.info("[setup 3/4] PR head is %s", sha[:12])
+
+        log.info("[setup 4/4] Creating patch branch %s", branch)
+        repo.create_branch(branch, sha)
+    except BaseException:
+        # Don't leave a half-prepared workspace behind (also on Ctrl-C).
+        log.debug("Setup failed; removing %s", run_dir)
+        shutil.rmtree(_require_inside_workspace(run_dir, settings), ignore_errors=True)
+        raise
     log.info("Workspace ready at %s (%.1fs)", dest, time.monotonic() - started)
     return PreparedRepo(run_dir=run_dir, path=dest, repo=ref, pr=pr, branch=branch, pr_head_sha=sha)
 

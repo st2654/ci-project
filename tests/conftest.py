@@ -69,6 +69,14 @@ def fake_remote(tmp_path: Path) -> FakeRemote:
     return FakeRemote(bare=bare, main_sha=main_sha, pr_sha=pr_sha)
 
 
+@pytest.fixture(scope="session")
+def sample_remote(tmp_path_factory: pytest.TempPathFactory):
+    """The sample repo as a bare remote, built once per session (tests clone it, never write)."""
+    from pipeline_helpers import make_sample_remote
+
+    return make_sample_remote(tmp_path_factory.mktemp("sample"))
+
+
 # Shared helpers for workspace-level tests.
 REPO_URL = "https://github.com/octo/repo"
 
