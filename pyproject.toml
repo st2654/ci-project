@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
+    "pygithub>=2.10.0",
 ]
 
 [project.scripts]
@@ -34,3 +35,4 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: needs network/GitHub; run with CI_FIX_RUN_INTEGRATION=1"]

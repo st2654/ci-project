@@ -4,6 +4,7 @@ import os
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
@@ -33,14 +34,16 @@ class Settings(BaseModel):
     workspace_dir: Path = Field(default=Path("~/.ci-fix/workspaces"), validate_default=True)
     branch_prefix: str = Field(default="ci-fix/pr-", min_length=1)
     pytest_args: list[str] = Field(default_factory=list)
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    log_file: Path | None = None
     regression_command: list[str] = Field(default_factory=lambda: ["pytest"], min_length=1)
     anthropic_api_key: SecretStr | None = None
     github_token: SecretStr | None = None
 
-    @field_validator("workspace_dir", mode="after")
+    @field_validator("workspace_dir", "log_file", mode="after")
     @classmethod
-    def _expand_user(cls, value: Path) -> Path:
-        return value.expanduser()
+    def _expand_user(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
 
     def require_secrets(self) -> None:
         """Raise ConfigError naming every required secret env var that is not set."""

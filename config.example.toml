@@ -21,3 +21,7 @@ branch_prefix = "ci-fix/pr-"
 pytest_args = []
 # Command for the full regression suite, run only when source files changed.
 regression_command = ["pytest"]
+# Console log level: DEBUG, INFO, WARNING or ERROR. INFO shows pipeline progress.
+log_level = "INFO"
+# Optional file that receives full DEBUG logs for troubleshooting (~ is expanded).
+# log_file = "~/.ci-fix/ci-fix.log"

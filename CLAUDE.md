@@ -34,6 +34,7 @@ opens a PR with a concise, human-readable description.
 | Target test framework | **pytest only** (v1). Keep the runner behind an interface so others can be added later. |
 | What a fix may change | Test files **and** source code. A source change must fix the real bug, never special-case the test (see "Integrity rules"). |
 | Delivery | Push patch branch `ci-fix/pr-<N>` and **open a PR targeting the original PR's branch** (the fix layers on top of that PR) |
+| Fork PRs | If the PR comes from a fork: push the fix to the fork's branch **only when** `maintainer_can_modify` is true and the token has access; otherwise skip the push/PR and return the fix as a diff with a clear message. |
 | Execution | Run tests **locally** on the host for now. Docker sandbox is a future slice. |
 | Fix attempts | **3** fix → re-test rounds per test, then report it as unfixable |
 | Regression runs | Run the **full test suite** **only if the fix changed source code** (non-test files). Test-only fixes re-run just the target tests. |
@@ -212,6 +213,19 @@ tests/
 | — | *Future:* Docker sandbox, other test frameworks | — |
 
 ---
+
+## Logging
+
+- Use `log = get_logger(__name__)` from `ci_fix.logging_setup`; never `print` in library code.
+- The library never configures handlers on import (a `NullHandler` is installed). The CLI or
+  caller calls `configure_logging(level, log_file, secrets)` once at startup.
+- **INFO** = progress a user wants to watch. Pipeline steps are prefixed like
+  `[setup 2/4] Cloning ...`, with durations for slow steps.
+- **DEBUG** = troubleshooting detail: every git and pytest command, its duration, and its stderr.
+  Lower-level tools (git, GitHub) log at DEBUG; pipeline steps own the INFO lines.
+- **WARNING/ERROR** = something went wrong or needs attention (e.g. a test marked UNFIXABLE).
+- Secrets must never be logged. Mask them with `_redact` / `RedactSecretsFilter`, and test that.
+- Config: `log_level` (console, default INFO) and optional `log_file` (full DEBUG log).
 
 ## Coding conventions
 
