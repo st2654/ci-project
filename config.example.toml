@@ -1,0 +1,23 @@
+# ci-fix configuration example.
+# Copy this file to config.toml (gitignored) and adjust the values.
+# Secrets are NOT read from this file. Set them as environment variables:
+#   export ANTHROPIC_API_KEY=...
+#   export GITHUB_TOKEN=...      # needs repo + pull request write access
+
+[ci_fix]
+# Anthropic model used by the fixer agent.
+model = "claude-sonnet-5-5"
+# Sampling temperature for the model (0.0 to 1.0).
+temperature = 0.0
+# Fix -> re-test rounds per failing test before it is reported as unfixable.
+max_attempts = 3
+# Maximum number of fixes run in parallel.
+max_parallel_workers = 4
+# Directory where repositories are cloned and worktrees are created (~ is expanded).
+workspace_dir = "~/.ci-fix/workspaces"
+# Prefix for the patch branch; the PR number is appended.
+branch_prefix = "ci-fix/pr-"
+# Extra arguments passed to pytest when running the target tests.
+pytest_args = []
+# Command for the full regression suite, run only when source files changed.
+regression_command = ["pytest"]
