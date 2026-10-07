@@ -74,6 +74,9 @@ setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► selec
                                                           verify_one ◄─ fix_one
                                             (fix_one skips verify when the attempt is
                                              rejected early or the fixer gives up)
+
+select_next ─► plan_round ═► fix_in_worktree (×K, Send) ─► merge_candidates ─► select_next
+              (parallel mode: ≥2 independent groups pending and max_parallel_workers > 1)
 ```
 
 1. **setup_repo** — Clone the repo, fetch `pull/<N>/head`, create branch
@@ -83,9 +86,8 @@ setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► selec
    XML, and parse that file (never scrape the console). Tests that already pass
    are reported as such and not touched; failing ones become `pending`.
 4. **Fix one test at a time** (in the order the user gave them) — *checkpoint &
-   rollback*. Slice 7 adds a triage step: fix in parallel (separate worktrees,
-   LangGraph `Send`) only when failures are independent (no overlapping files in
-   their tracebacks); conflicting patches are redone sequentially.
+   rollback*. With `max_parallel_workers > 1` only the fixer (agent) work may run in
+   parallel; see "Parallel fixing" below.
    - **fix_one** calls the fixer for the next pending test. What changed is read
      from git, not from the fixer's claim. No change, or a fixer error, is a
      rejected attempt; a fixer that reports *unfixable* has its edits rolled back.
@@ -107,6 +109,40 @@ setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► selec
    - **Rejected** attempts are **rolled back** (`reset --hard` + `clean -fd`), and
      the rejection reason is passed to the next attempt. After `max_attempts`
      (default 3) the test is UNFIXABLE with the last reason.
+   - **Parallel fixing** (slice 7, `ci_fix/triage.py`): at each `select_next` the
+     pending tests are grouped. Tests are in one group when the repo files mentioned in
+     their failure tracebacks (`path.py:12:` and `File "path.py", line N`; files outside
+     the repo, site-packages and venvs ignored) overlap, transitively, or when they are in
+     the same test file. `conftest.py` frames are ignored for linking (shared fixtures would
+     glue unrelated tests together); grouping that is too fine only costs a sequential retry
+     when patches conflict. If `max_parallel_workers == 1` or there is only one group, the
+     sequential path above runs unchanged. Otherwise a round (`plan_round`) takes the
+     first pending test of up to `max_parallel_workers` groups and fans out with LangGraph
+     `Send` to `fix_in_worktree`: each runs the fixer in its own detached git worktree
+     (`<run_dir>/worktrees/r<round>-<n>`, at the current HEAD, removed afterwards) with its
+     own runner (reports under `reports/worktrees/`), then captures the fixer's change set
+     as a raw-bytes binary diff (`GitRepo.patch`, never decoded, so CRLF, non-UTF-8,
+     binary files and mode changes round-trip exactly). Files a branch's own test runs create
+     are kept in a private per-branch set and left out of its patch (`patch(skip=...)`);
+     branches never write the `info/exclude` file, which all worktrees share and which could
+     otherwise hide another branch's new file. Writes to `info/exclude` (main checkout) are
+     deduplicated under a lock. Fixer errors become rejected attempts; `FixerFatalError`
+     stops the run — LangGraph first waits for the branches still running (each removes
+     its own worktree), then the error propagates. **Acceptance stays serial:** `merge_candidates` takes the candidates in `pending`
+     order, applies each patch to the main checkout (`git apply`) and runs the same
+     pipeline as the sequential path (`after_fixer`: changed files, unfixable, integrity
+     check; `judge_and_commit`: verify, reviewer, regression, checkpoint/rollback). A
+     candidate whose test was already fixed by an earlier candidate is dropped. A patch that
+     no longer applies (it conflicts with a fix accepted earlier in the round) uses no
+     attempt and is retried sequentially before the next round (`[parallel] patch for X
+     conflicts with an accepted fix; retrying sequentially`).
+   - *Parallel limitation:* the test venv's editable install points at the main checkout,
+     so a worktree runner sets `PYTHONPATH` to `<worktree>/src` (if it exists) and the
+     worktree root to make the worktree's code win. Other layouts (other package dirs,
+     `package_dir` mappings, compiled extensions) may still import the main checkout's code
+     while the fixer runs its test; the serial verification in the main checkout is
+     unaffected. Tests can plug in their own runner via `PipelineDeps.worktree_runner_factory`
+     (default: `runner_factory` when that is not the default one).
 5. **regression** (slice 6, inside verify_one) — Only for an attempt that would
    otherwise be accepted and changed a source (non-test) file:
    - **Baseline** (once per run): the attempt is stashed (`git stash -u`), the full

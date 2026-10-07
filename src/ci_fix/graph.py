@@ -6,6 +6,12 @@ Failing tests are fixed one at a time. Every attempt is verified against ALL req
 tests: an accepted attempt becomes a local checkpoint commit, a rejected one is rolled back
 and its reason is passed to the next attempt. An attempt that changed source (non-test) files
 must also not break any test of the full suite that passed before (regression check).
+
+Parallel fixing (``max_parallel_workers > 1``): when the pending tests fall into several
+independent groups (see :mod:`ci_fix.triage`), a round runs one fixer per group in its own git
+worktree (``plan_round`` → ``fix_in_worktree`` via ``Send``); ``merge_candidates`` then applies
+each candidate patch to the main checkout and judges it serially, exactly like a sequential
+attempt. A patch that no longer applies is retried sequentially.
 """
 
 from __future__ import annotations
@@ -14,10 +20,11 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from pydantic import BaseModel, ConfigDict, Field
 
 from ci_fix.config import Settings
@@ -42,7 +49,9 @@ from ci_fix.tools.pytest_runner import (
     TestStatus,
     resolve_test_names,
 )
+from ci_fix.tools.target_env import build_target_env
 from ci_fix.tools.test_env import TestEnv, create_test_env
+from ci_fix.triage import group_failures
 from ci_fix.workspace import PreparedRepo, prepare_pr_checkout
 
 log = get_logger(__name__)
@@ -91,6 +100,33 @@ def _default_runner_factory(
     )
 
 
+def worktree_pythonpath(worktree: Path) -> list[Path]:
+    """``PYTHONPATH`` entries that make a worktree's code shadow the editable install.
+
+    The test venv's editable install points at the main checkout, so tests run in a worktree
+    would import the main checkout's code. ``<worktree>/src`` (if present) and the worktree
+    root come first instead. *Limitation:* other layouts (packages in other dirs, compiled
+    extensions, ``package_dir`` mappings) may still import the main checkout's code.
+    """
+    worktree = Path(worktree)
+    src = worktree / "src"
+    return [src, worktree] if src.is_dir() else [worktree]
+
+
+def _default_worktree_runner_factory(
+    repo_path: Path, python: Path, reports_dir: Path, settings: Settings
+) -> TestRunner:
+    env = build_target_env(Path(python).parent.parent, worktree_pythonpath(repo_path))
+    return PytestRunner(
+        repo_path,
+        python,
+        reports_dir,
+        settings.pytest_args,
+        settings.test_timeout_seconds,
+        env=env,
+    )
+
+
 @dataclass(frozen=True)
 class PipelineDeps:
     """Collaborators the graph nodes use; swap any of them in tests. Shared between runs."""
@@ -103,6 +139,20 @@ class PipelineDeps:
     clone_url: str | None = None
     # Optional second opinion on test-file changes (see ``Settings.review_test_changes``).
     reviewer: TestChangeReviewer | None = None
+    # Builds the runner for a parallel-fix worktree. None = a ``PytestRunner`` whose
+    # ``PYTHONPATH`` puts the worktree's code first when ``runner_factory`` is the default,
+    # otherwise ``runner_factory`` itself (e.g. a fake runner in tests).
+    worktree_runner_factory: Callable[[Path, Path, Path, Settings], TestRunner] | None = None
+
+    def make_worktree_runner(self, repo_path: Path, python: Path, reports_dir: Path) -> TestRunner:
+        factory = self.worktree_runner_factory
+        if factory is None:
+            factory = (
+                _default_worktree_runner_factory
+                if self.runner_factory is _default_runner_factory
+                else self.runner_factory
+            )
+        return factory(repo_path, python, reports_dir, self.settings)
 
 
 @dataclass
@@ -121,6 +171,21 @@ class RunContext:
         if self.prepared is None:
             raise RuntimeError("workspace not prepared (setup_repo did not run)")
         return GitRepo(self.prepared.path)
+
+
+class Candidate(BaseModel):
+    """What one parallel fixer produced in its worktree, awaiting the serial merge."""
+
+    node_id: str
+    attempt: FixAttempt | None = None  # None when the fixer raised
+    patch: bytes = b""  # raw binary git diff of the fixer's changes against the round's HEAD
+    error: str | None = None  # fixer (or worktree) error message
+    elapsed: float = 0.0  # seconds the fixer took
+
+
+def _collect_candidates(old: list[Candidate], new: list[Candidate]) -> list[Candidate]:
+    """Reducer: parallel branches append their candidates; an empty update clears the list."""
+    return [*old, *new] if new else []
 
 
 class PipelineState(BaseModel):
@@ -150,6 +215,12 @@ class PipelineState(BaseModel):
     regression_unavailable: bool = False
     preexisting_failures: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # Parallel fixing: rounds started so far, candidates of the current round (appended by
+    # the parallel branches, cleared by the merge) and tests whose patch conflicted with an
+    # accepted fix, to be retried sequentially before the next round.
+    parallel_round: int = 0
+    candidates: Annotated[list[Candidate], _collect_candidates] = Field(default_factory=list)
+    serial_queue: list[str] = Field(default_factory=list)
     diff: str = ""
     summary: str = ""
 
@@ -157,10 +228,15 @@ class PipelineState(BaseModel):
 def recursion_limit(settings: Settings, n_tests: int) -> int:
     """Graph step limit for ``n_tests`` unique test ids.
 
-    Each attempt is at most 3 steps (select_next → fix_one → verify_one); 20 covers the
-    fixed steps (setup, resolve, run, final select_next, finalize) with room to spare.
+    Sequentially each attempt is at most 3 steps (select_next → fix_one → verify_one). A
+    parallel round is 4 steps (select_next → plan_round → fix_in_worktree → merge_candidates).
+    Every candidate either uses up an attempt or, if its patch does not apply, is queued for a
+    sequential retry (3 steps) that does. Worst case a round with one candidate that does not
+    apply: 4 + 3 = 7 steps for one attempt, so 7 per attempt bounds parallel runs. 20 covers
+    the fixed steps (setup, resolve, run, final select_next, finalize).
     """
-    return n_tests * settings.max_attempts * 3 + 20
+    per_attempt = 7 if settings.max_parallel_workers > 1 else 3
+    return n_tests * settings.max_attempts * per_attempt + 20
 
 
 def _ctx(config: RunnableConfig) -> RunContext:
@@ -403,8 +479,10 @@ def build_graph(deps: PipelineDeps) -> Any:
         )
         return {"name_to_id": name_to_id, "outcomes": outcomes}
 
-    def run_tests(ids: list[str], config: RunnableConfig) -> dict[str, TestResult]:
-        run = _runner(config).run(ids)
+    def run_tests(
+        ids: list[str], config: RunnableConfig, runner: TestRunner | None = None
+    ) -> dict[str, TestResult]:
+        run = (runner or _runner(config)).run(ids)
         return {nid: run.results.get(nid) or _not_found(nid) for nid in ids}
 
     def run_initial(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
@@ -429,9 +507,22 @@ def build_graph(deps: PipelineDeps) -> Any:
         log.info("[run] %d failing test(s) to fix", len(pending))
         return {"outcomes": outcomes, "pending": pending, "results": results}
 
+    def groups_of(state: PipelineState) -> list[list[str]]:
+        """Independent groups of the pending tests, from their failure tracebacks at HEAD."""
+        assert state.prepared is not None
+        details = {nid: res.details for nid, res in state.results.items()}
+        return group_failures(state.pending, details, state.prepared.path)
+
     def select_next(state: PipelineState) -> dict[str, Any]:
         # Tests fixed as a side effect of another fix are removed from ``pending`` by
-        # verify_one, so the first pending id always still fails at HEAD.
+        # verify_one, so every pending id still fails at HEAD.
+        if settings.max_parallel_workers > 1 and state.pending:
+            queue = [q for q in state.serial_queue if q in state.pending]
+            if queue:  # a patch that conflicted in the last parallel round: retry it alone
+                log.debug("[fix] Sequential retry: %s", queue[0])
+                return {"current": queue[0], "serial_queue": queue[1:]}
+            if len(groups_of(state)) > 1:
+                return {"current": None, "serial_queue": []}  # → plan_round
         current = state.pending[0] if state.pending else None
         if current is not None:
             log.debug("[fix] Next test: %s (%d pending)", current, len(state.pending))
@@ -471,8 +562,22 @@ def build_graph(deps: PipelineDeps) -> Any:
             ctx.pr_diff = truncate_text(diff, settings.pr_diff_max_chars)
         return ctx.pr_diff
 
-    def make_run_test(target: str, config: RunnableConfig) -> Callable[[str], TestResult]:
-        repo = _ctx(config).repo
+    def make_run_test(
+        target: str,
+        config: RunnableConfig,
+        repo: GitRepo | None = None,
+        runner: TestRunner | None = None,
+        on_artifacts: Callable[[set[str]], None] | None = None,
+    ) -> Callable[[str], TestResult]:
+        """``run_test`` for the fixer: runs ``target`` only, in ``repo`` with ``runner``
+        (default: the main checkout and its runner).
+
+        Files a run creates are artifacts: by default they go to ``info/exclude``; a
+        worktree passes ``on_artifacts`` to collect them privately instead (the exclude file
+        is shared by all worktrees and could hide another branch's new file).
+        """
+        repo = repo or _ctx(config).repo
+        record = on_artifacts or repo.exclude
 
         def run_test(node_id: str) -> TestResult:
             if node_id != target:
@@ -481,22 +586,31 @@ def build_graph(deps: PipelineDeps) -> Any:
                 )
             untracked_before = repo.untracked_files()
             try:
-                return run_tests([node_id], config)[node_id]
+                return run_tests([node_id], config, runner)[node_id]
             finally:
                 # Files the test run created are artifacts, not fixer changes.
-                repo.exclude(repo.untracked_files() - untracked_before)
+                record(repo.untracked_files() - untracked_before)
 
         return run_test
 
     def make_request(
-        state: PipelineState, nid: str, n: int, previous: list[FixAttempt], config: RunnableConfig
+        state: PipelineState,
+        nid: str,
+        n: int,
+        previous: list[FixAttempt],
+        config: RunnableConfig,
+        repo_path: Path | None = None,
+        run_test: Callable[[str], TestResult] | None = None,
     ) -> FixRequest:
-        """The fixer's (and reviewer's) view of attempt ``n`` for ``nid`` at the current HEAD."""
+        """The fixer's (and reviewer's) view of attempt ``n`` for ``nid`` at the current HEAD.
+
+        ``repo_path``/``run_test`` default to the main checkout (a worktree when parallel).
+        """
         assert state.prepared is not None
         failure = state.results.get(nid)
         return FixRequest(
             node_id=nid,
-            repo_path=state.prepared.path,
+            repo_path=repo_path or state.prepared.path,
             attempt=n,
             max_attempts=settings.max_attempts,
             failure_message=failure.message if failure else "",
@@ -506,7 +620,7 @@ def build_graph(deps: PipelineDeps) -> Any:
             pr_body=state.prepared.pr.body,
             pr_diff=pr_diff(state.prepared, _ctx(config)),
             other_failing_tests=[p for p in state.pending if p != nid],
-            run_test=make_run_test(nid, config),
+            run_test=run_test or make_run_test(nid, config),
         )
 
     def run_check(repo: GitRepo, nid: str, explanation: str) -> tuple[PatchReport | None, str]:
@@ -540,11 +654,40 @@ def build_graph(deps: PipelineDeps) -> Any:
         except Exception as exc:  # a fixer bug must not crash the whole run
             log.error("[fix] fixer raised for %s: %s", nid, exc, exc_info=True)
             repo.rollback()  # drop any partial edits
-            failed = FixAttempt(
-                node_id=nid, attempt=n, outcome="no_change", explanation=f"fixer error: {exc}"
-            )
-            return reject(state, previous, failed, f"fixer error: {exc}", update)
+            return reject_fixer_error(state, nid, n, previous, str(exc), update)
+        elapsed = time.monotonic() - started
+        return after_fixer(state, nid, n, previous, attempt, update, config, elapsed)
 
+    def reject_fixer_error(
+        state: PipelineState,
+        nid: str,
+        n: int,
+        previous: list[FixAttempt],
+        error: str,
+        update: dict[str, Any],
+    ) -> dict[str, Any]:
+        failed = FixAttempt(
+            node_id=nid, attempt=n, outcome="no_change", explanation=f"fixer error: {error}"
+        )
+        return reject(state, previous, failed, f"fixer error: {error}", update)
+
+    def after_fixer(
+        state: PipelineState,
+        nid: str,
+        n: int,
+        previous: list[FixAttempt],
+        attempt: FixAttempt,
+        update: dict[str, Any],
+        config: RunnableConfig,
+        elapsed: float,
+    ) -> dict[str, Any]:
+        """Judge what the fixer left in the main checkout's working tree (before tests run).
+
+        Reads the change set from git; handles *unfixable*, *no change* and the integrity
+        check. Returns a state update; an attempt that is still unjudged afterwards (last
+        history entry with ``accepted is None``) goes on to :func:`judge_and_commit`.
+        """
+        repo = _ctx(config).repo
         files = repo.changed_files()
         if sorted(set(attempt.files_changed)) != files:
             log.debug("[fix] fixer reported %s, git shows %s", attempt.files_changed, files)
@@ -553,7 +696,7 @@ def build_graph(deps: PipelineDeps) -> Any:
             "[fix] %s: %s in %.1fs%s",
             nid,
             attempt.outcome,
-            time.monotonic() - started,
+            elapsed,
             f" ({', '.join(files)})" if files else "",
         )
         if attempt.outcome == "unfixable":
@@ -580,7 +723,16 @@ def build_graph(deps: PipelineDeps) -> Any:
 
     def verify_one(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
         assert state.current is not None
-        nid = state.current
+        return judge_and_commit(state, state.current, config)
+
+    def judge_and_commit(state: PipelineState, nid: str, config: RunnableConfig) -> dict[str, Any]:
+        """Verify the checked attempt for ``nid`` in the main checkout; commit or roll back.
+
+        Re-runs all requested tests (flaky re-runs), asks the optional reviewer, runs the
+        regression check for source/shared-test changes, then checkpoints an accepted attempt
+        (marking side-effect fixes) or rolls a rejected one back. Used by the sequential
+        ``verify_one`` and by the parallel ``merge_candidates``.
+        """
         repo = _ctx(config).repo
         n = state.attempts[nid]
         *earlier, attempt = state.history[nid]
@@ -848,6 +1000,141 @@ def build_graph(deps: PipelineDeps) -> Any:
         log.warning("[review] %s: test change rejected: %s", nid, verdict.reason)
         return f"{REVIEWER_PREFIX} {verdict.reason}"
 
+    # ---- parallel fixing ----------------------------------------------------------------
+
+    def round_tests(state: PipelineState) -> list[str]:
+        """The first pending test of each group, for up to ``max_parallel_workers`` groups."""
+        return [g[0] for g in groups_of(state)][: settings.max_parallel_workers]
+
+    def plan_round(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
+        assert state.prepared is not None
+        n_round = state.parallel_round + 1
+        tests = round_tests(state)
+        pr_diff(state.prepared, _ctx(config))  # computed once here, not in the threads
+        log.info(
+            "[parallel] round %d: fixing %d test(s) in parallel: %s",
+            n_round,
+            len(tests),
+            ", ".join(tests),
+        )
+        return {"parallel_round": n_round, "current": None, "candidates": []}
+
+    def fan_out(state: PipelineState) -> list[Send]:
+        return [
+            Send("fix_in_worktree", state.model_copy(update={"current": nid}))
+            for nid in round_tests(state)
+        ]
+
+    def worktree_dir(prepared: PreparedRepo, name: str) -> Path:
+        """``run_dir/worktrees/<name>``, refusing anything outside the run dir."""
+        root = (prepared.run_dir / "worktrees").resolve()
+        path = (root / name).resolve()
+        if not path.is_relative_to(root) or path == root:
+            raise ValueError(f"worktree path {path} is outside {root}")
+        return path
+
+    def fix_in_worktree(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
+        """Run the fixer for ``state.current`` in its own worktree; return its patch.
+
+        Runs in a thread next to the other branches of the round: it only touches its own
+        worktree and runner (and appends artifact paths to the shared ``info/exclude``).
+        """
+        assert state.prepared is not None and state.current is not None
+        nid = state.current
+        n = state.attempts.get(nid, 0) + 1
+        previous = state.history.get(nid, [])
+        main = _ctx(config).repo
+        index = round_tests(state).index(nid) + 1
+        name = f"r{state.parallel_round}-{index}"
+        path = worktree_dir(state.prepared, name)
+        log.info("[fix] %s (attempt %d/%d, in parallel)", nid, n, settings.max_attempts)
+        added = False
+        try:
+            worktree = main.add_worktree(path)
+            added = True
+            log.debug("[parallel] %s: worktree %s", nid, path)
+            assert state.python is not None
+            runner = deps.make_worktree_runner(
+                path, state.python, state.prepared.reports_dir / "worktrees" / name
+            )
+            artifacts: set[str] = set()  # this branch's test-run artifacts, kept out of the patch
+            run_test = make_run_test(nid, config, worktree, runner, artifacts.update)
+            request = make_request(state, nid, n, previous, config, path, run_test)
+            started = time.monotonic()
+            attempt = deps.fixer.fix(request)
+            elapsed = time.monotonic() - started
+            patch = worktree.patch("HEAD", skip=artifacts)
+            log.debug("[parallel] %s: patch of %d byte(s)", nid, len(patch))
+            candidate = Candidate(node_id=nid, attempt=attempt, patch=patch, elapsed=elapsed)
+            return {"candidates": [candidate]}
+        except FixerFatalError as exc:
+            log.error("[fix] stopping the run: %s", exc)
+            raise
+        except Exception as exc:  # a fixer (or worktree) error must not crash the run
+            log.error("[fix] fixer raised for %s: %s", nid, exc, exc_info=True)
+            return {"candidates": [Candidate(node_id=nid, error=str(exc) or type(exc).__name__)]}
+        finally:
+            if added:
+                main.remove_worktree(path)
+                log.debug("[parallel] %s: removed worktree %s", nid, path)
+
+    def merge_candidates(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
+        """Apply and judge the round's candidates one by one, in ``pending`` order."""
+        assert state.prepared is not None
+        repo = _ctx(config).repo
+        order = {nid: i for i, nid in enumerate(state.pending)}
+        candidates = sorted(state.candidates, key=lambda c: order.get(c.node_id, len(order)))
+        serial_queue: list[str] = []
+        merged: dict[str, Any] = {}
+
+        def advance(update: dict[str, Any]) -> None:
+            nonlocal state
+            merged.update(update)
+            state = state.model_copy(update=update)
+
+        for i, cand in enumerate(candidates, 1):
+            nid = cand.node_id
+            if nid not in state.pending:  # fixed as a side effect of an earlier candidate
+                log.info("[parallel] %s already passes; candidate not needed", nid)
+                continue
+            log.info("[parallel] merging candidate for %s", nid)
+            n = state.attempts.get(nid, 0) + 1
+            previous = state.history.get(nid, [])
+            update: dict[str, Any] = {"attempts": {**state.attempts, nid: n}}
+            if cand.attempt is None:
+                advance(reject_fixer_error(state, nid, n, previous, cand.error or "", update))
+                continue
+            if cand.attempt.outcome != "unfixable" and cand.patch:
+                patch_file = (
+                    state.prepared.reports_dir
+                    / "worktrees"
+                    / f"merge-r{state.parallel_round}-{i}.patch"
+                )
+                patch_file.parent.mkdir(parents=True, exist_ok=True)
+                patch_file.write_bytes(cand.patch)
+                try:
+                    repo.apply_patch(patch_file)
+                except GitError as exc:
+                    log.debug("[parallel] apply failed for %s: %s", nid, exc)
+                    log.info(
+                        "[parallel] patch for %s conflicts with an accepted fix; "
+                        "retrying sequentially",
+                        nid,
+                    )
+                    # The main checkout was clean before the apply (every earlier candidate
+                    # ended in a checkpoint commit or a rollback) and ``git apply`` is atomic,
+                    # so this rollback is a no-op safety net; it never touches accepted fixes.
+                    repo.rollback()
+                    serial_queue.append(nid)
+                    continue
+            advance(
+                after_fixer(state, nid, n, previous, cand.attempt, update, config, cand.elapsed)
+            )
+            last = state.history.get(nid, [])
+            if last and last[-1].accepted is None and last[-1].outcome != "unfixable":
+                advance(judge_and_commit(state, nid, config))
+        return {**merged, "candidates": [], "current": None, "serial_queue": serial_queue}
+
     def finalize(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
         diff = ""
         if state.prepared is not None:
@@ -876,7 +1163,9 @@ def build_graph(deps: PipelineDeps) -> Any:
         return "run_initial" if state.name_to_id else "finalize"
 
     def after_select(state: PipelineState) -> str:
-        return "fix_one" if state.current is not None else "finalize"
+        if state.current is not None:
+            return "fix_one"
+        return "plan_round" if state.pending else "finalize"
 
     def after_fix(state: PipelineState) -> str:
         # Only an attempt that changed files and is still unjudged goes to verification.
@@ -893,6 +1182,9 @@ def build_graph(deps: PipelineDeps) -> Any:
     graph.add_node("select_next", select_next)
     graph.add_node("fix_one", fix_one)
     graph.add_node("verify_one", verify_one)
+    graph.add_node("plan_round", plan_round)
+    graph.add_node("fix_in_worktree", fix_in_worktree)
+    graph.add_node("merge_candidates", merge_candidates)
     graph.add_node("finalize", finalize)
 
     graph.add_edge(START, "setup_repo")
@@ -900,8 +1192,11 @@ def build_graph(deps: PipelineDeps) -> Any:
     graph.add_edge("setup_env", "resolve_tests")
     graph.add_conditional_edges("resolve_tests", after_resolve, ["run_initial", "finalize"])
     graph.add_edge("run_initial", "select_next")
-    graph.add_conditional_edges("select_next", after_select, ["fix_one", "finalize"])
+    graph.add_conditional_edges("select_next", after_select, ["fix_one", "plan_round", "finalize"])
     graph.add_conditional_edges("fix_one", after_fix, ["verify_one", "select_next"])
     graph.add_edge("verify_one", "select_next")
+    graph.add_conditional_edges("plan_round", fan_out, ["fix_in_worktree"])
+    graph.add_edge("fix_in_worktree", "merge_candidates")
+    graph.add_edge("merge_candidates", "select_next")
     graph.add_edge("finalize", END)
     return graph.compile()

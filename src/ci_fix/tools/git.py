@@ -6,6 +6,7 @@ import base64
 import os
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -51,6 +52,9 @@ def _redact(text: str, token: str | None) -> str:
 
 _GLOB_SPECIAL_RE = re.compile(r"([\\*?\[])")
 _URL_CREDENTIALS_RE = re.compile(r"(://)[^/@\s]+@")
+# Serialises read-dedupe-append of ``info/exclude`` (shared by a repo and its worktrees,
+# written from parallel-fix threads).
+_EXCLUDE_LOCK = threading.Lock()
 
 
 def _safe_url(url: str) -> str:
@@ -115,6 +119,30 @@ def run_git(
     if proc.stderr.strip():
         log.debug("git stderr: %s", _redact(proc.stderr.strip(), token))
     return proc.stdout.rstrip("\n")
+
+
+def run_git_bytes(args: Sequence[str], cwd: Path | None = None, timeout: float = 600) -> bytes:
+    """Run ``git *args`` (no token) and return stdout as raw bytes, untouched.
+
+    For output that must round-trip exactly (patches with CRLF, latin-1 or binary content).
+    Only the output's size is logged; stderr is decoded with replacement for errors.
+    """
+    argv = ["git", *_SAFE_CONFIG, *args]
+    log.debug("$ %s (cwd=%s)", " ".join(["git", *args]), cwd or ".")
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            argv, cwd=cwd, env=_git_env(None), capture_output=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise GitError(f"git command timed out after {timeout}s: {argv}") from None
+    except OSError as exc:
+        raise GitError(f"failed to run {argv}: {exc}") from None
+    stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        raise GitError(f"git command failed (exit {proc.returncode}): {argv}\n{stderr}".rstrip())
+    log.debug("git ok in %.2fs (%d bytes)", time.monotonic() - started, len(proc.stdout))
+    return proc.stdout
 
 
 class GitRepo:
@@ -308,14 +336,66 @@ class GitRepo:
             exclude_file = self.path / exclude_file
         exclude_file.parent.mkdir(parents=True, exist_ok=True)
         # Anchored, glob characters escaped: each line matches exactly one path.
-        escaped = (_GLOB_SPECIAL_RE.sub(r"\\\1", p) for p in paths)
-        lines = "".join(f"/{p}\n" for p in escaped)
-        existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
-        if existing and not existing.endswith("\n"):
-            lines = "\n" + lines
-        with exclude_file.open("a", encoding="utf-8") as fh:
-            fh.write(lines)
+        wanted = ["/" + _GLOB_SPECIAL_RE.sub(r"\\\1", p) for p in paths]
+        with _EXCLUDE_LOCK:
+            existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+            present = set(existing.splitlines())
+            new = [line for line in wanted if line not in present]
+            if not new:
+                return
+            lines = "".join(f"{line}\n" for line in new)
+            if existing and not existing.endswith("\n"):
+                lines = "\n" + lines
+            with exclude_file.open("a", encoding="utf-8") as fh:
+                fh.write(lines)
         log.debug("Excluded %d untracked artifact(s): %s", len(paths), ", ".join(paths[:10]))
+
+    def add_worktree(self, path: Path, ref: str = "HEAD") -> GitRepo:
+        """Check ``ref`` out (detached) into a new linked worktree at ``path``.
+
+        The worktree shares this repo's object store, refs and ``.git/info/exclude``.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._git("worktree", "add", "--detach", "-q", str(path), ref)
+        log.debug("Added worktree %s at %s", path, ref)
+        return GitRepo(path)
+
+    def remove_worktree(self, path: Path) -> None:
+        """Remove the linked worktree at ``path`` and prune stale entries; never raises."""
+        try:
+            self._git("worktree", "remove", "--force", str(path))
+        except GitError as exc:
+            log.warning("Could not remove worktree %s: %s", path, exc)
+        try:
+            self._git("worktree", "prune")
+        except GitError as exc:
+            log.warning("Could not prune worktrees: %s", exc)
+        log.debug("Removed worktree %s", path)
+
+    def patch(self, base: str = "HEAD", skip: Iterable[str] = ()) -> bytes:
+        """Binary-safe diff of the working tree (new files included) against ``base``.
+
+        Raw bytes, never decoded, so CRLF, non-UTF-8 and binary changes round-trip exactly
+        through :meth:`apply_patch`. Gitignored and ``info/exclude``'d files are not included,
+        nor are untracked files listed in ``skip`` (e.g. a worktree's test-run artifacts).
+        """
+        skip = set(skip)
+        if not skip:
+            self._git("add", "--all", "--intent-to-add")
+        else:
+            new = sorted(self.untracked_files() - skip)
+            if new:
+                self._git("add", "--intent-to-add", "--", *(f":(literal){p}" for p in new))
+        return run_git_bytes(["diff", "--binary", "--no-color", "--no-ext-diff", base], self.path)
+
+    def apply_patch(self, patch_file: Path) -> None:
+        """Apply the patch in ``patch_file`` (raw bytes from :meth:`patch`) to the working tree.
+
+        GitError if it does not apply; nothing is changed then (``git apply`` is atomic).
+        """
+        self._git("apply", "--whitespace=nowarn", str(patch_file))
+        log.debug("Applied patch %s", patch_file)
 
     def exclude_untracked(self) -> list[str]:
         """Exclude every currently untracked file; return what was excluded."""
