@@ -407,6 +407,8 @@ tests/
 
 ## Slices
 
+Status: slices 0–9 complete (2026-10-07). Next candidates: Docker sandbox, more test frameworks.
+
 | # | Slice | Acceptance |
 |---|---|---|
 | 0 | Project setup: `uv`, ruff, pytest, config loader, `config.example.toml` | `uv run pytest` is green |
