@@ -33,8 +33,8 @@ opens a PR with a concise, human-readable description.
 | LLM | Anthropic `claude-sonnet-4-6`, **temperature 0** (both configurable). Newer models (`claude-sonnet-5-5`, `claude-opus-5-5`) reject `temperature`; for them set `temperature = "default"` so it isn't sent. Fatal API errors (400/401/403/404: bad key, no credit, unsupported parameter) stop the run instead of using up attempts. |
 | Target test framework | **pytest only** (v1). Keep the runner behind an interface so others can be added later. |
 | What a fix may change | Test files **and** source code. A source change must fix the real bug, never special-case the test (see "Integrity rules"). |
-| Delivery | Push patch branch `ci-fix/pr-<N>` and **open a PR targeting the original PR's branch** (the fix layers on top of that PR) |
-| Fork PRs | If the PR comes from a fork: push the fix to the fork's branch **only when** `maintainer_can_modify` is true and the token has access; otherwise skip the push/PR and return the fix as a diff with a clear message. |
+| Delivery | Squash the accepted fixes into **one commit**, force-push patch branch `ci-fix/pr-<N>` and **open (or update) a PR targeting the original PR's branch** (the fix layers on top of that PR); comment on the original PR. `push = false` / `--no-push` is a dry run. See "Delivery". |
+| Fork PRs | If the PR comes from a fork: push `ci-fix/pr-<N>` to the fork and open the fix PR there (into the fork's PR branch) **only when** `maintainer_can_modify` is true and the fork's clone URL is known; otherwise skip the push/PR/comment, add the warning `fork PR: cannot push (maintainer edits not allowed); returning the diff only` and return the fix as a diff. |
 | Execution | Run tests **locally** (Docker postponed). Each run gets its own workspace `<workspace_dir>/<owner>__<repo>__pr-<N>__<YYYYmmdd-HHMMSS>-<6 hex>/` (unique, so concurrent runs on the same PR never collide) with `repo/`, `venv/` (separate uv venv) and `reports/`; it is **deleted at the end of the run** unless `keep_workspace = true`. |
 | Target-repo isolation | PR code runs with an **allowlisted environment**: its own venv, no `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`/`PYTHON*`/`CI_FIX_*`. Timeouts kill the whole process group. PR tests can write to `.git`, so every git call runs with hooks and fsmonitor disabled (`-c core.hooksPath=/dev/null -c core.fsmonitor=false`) and without those secret env vars. |
 | Test names | Full pytest node ids are used as given; bare names (`test_a`, `Cls::test_a`) are resolved via `pytest --collect-only`. Ambiguous or unknown names are reported, never guessed. |
@@ -55,20 +55,23 @@ result = fix_failing_tests(
     failing_tests=["tests/test_x.py::test_a", "tests/test_y.py::test_b"],
 )
 result.branch          # "ci-fix/pr-42"
-result.pr_url          # URL of the opened fix PR
+result.pr_url          # URL of the opened/updated fix PR (None: dry run, no fixes, fork w/o push)
 result.diff            # unified git diff of all fixes
-result.summary         # markdown description (readable in 2–3 minutes)
+result.summary         # markdown description = the fix PR body (readable in 2–3 minutes)
 result.tests           # per-test: FIXED | UNFIXABLE (+ reason, attempts)
+result.commit_sha      # the squashed fix commit (also in a dry run); commit_message, pr_body
+result.pushed          # whether the branch was pushed
 ```
 
-CLI equivalent: `ci-fix --repo <url> --pr <n> --tests <id> [<id> ...]`
+CLI equivalent: `ci-fix --repo <url> --pr <n> --tests <id> [<id> ...] [--no-push] [--no-comment]`.
+The CLI prints the fix PR URL (or "Dry run" / "No fixes" / "Fixes not pushed"), then the summary.
 
 ---
 
 ## Pipeline (LangGraph)
 
 ```
-setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► select_next ─┬─► finalize
+setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► select_next ─┬─► finalize ─► deliver
                                                                ▲        │ (pending empty)
                                                                │        ▼
                                                           verify_one ◄─ fix_one
@@ -175,8 +178,45 @@ select_next ─► plan_round ═► fix_in_worktree (×K, Send) ─► merge_ca
      latest baseline are returned in `FixResult.preexisting_failures` (slice 8 lists
      them in the PR description). Full-run artifacts are excluded like verify's.
 6. **finalize** — The diff against the PR head contains **only accepted fixes**
-   (the checkpoint commits). Slice 8 squashes the checkpoints into one commit with
-   a descriptive message, pushes the branch, opens the PR and returns `FixResult`.
+   (the checkpoint commits). Builds the commit message and PR description
+   (`ci_fix/report.py`, pure functions) and records whether the full suite was checked.
+7. **deliver** (slice 8, `ci_fix/delivery.py`, a graph node after finalize; the workspace
+   is removed afterwards by `fix_failing_tests`, also when delivery raises):
+   - **Nothing FIXED** → no commit, branch, push or PR (`pr_url` None). With `push` and
+     `comment_on_pr`, the original PR gets a comment listing the unfixable / not found
+     tests and their reasons.
+   - **Squash:** the checkpoint commits are kept as `refs/ci-fix/checkpoints`, then
+     `git reset --soft <pr_head_sha>` + one commit with the built message, author/committer
+     `commit_author_name`/`commit_author_email`, hooks off, no signing (`commit_sha`).
+   - **Dry run** (`push = false`, `--no-push`): stop after the squash (`[deliver] dry run:
+     not pushing`); `commit_message` and `pr_body` are in the result. No comment either.
+   - **Push guards** (`GitHubError`, nothing pushed): the fix branch must not be the PR's
+     head or base branch or the target repo's default branch; if it already exists on the
+     remote, it is force-updated only when its tip is ci-fix's (author email ==
+     `commit_author_email` and subject starts `ci-fix:`), else `branch X exists ... and was
+     not created by ci-fix`. `branch_prefix` must start with `ci-fix` (`ConfigError`).
+   - **Head moved:** right before the push the PR head is re-read from the API. If it
+     differs from the verified head, the push still happens, `FixResult.warnings` gets a
+     `PR head moved during the run ...` entry and the PR body starts with
+     `⚠ verified against `<old>`; `<head_ref>` has since moved to `<new>` — re-run ci-fix`.
+   - **Push:** same-repo PR → `git push --force origin ci-fix/pr-<N>` (it is the tool's own
+     branch; an INFO line says when it already existed). Fork PR → see "Fork PRs". Auth is
+     the token via the env-scoped extraheader, never in argv or logs. Failures raise
+     `GitError` with a hint (`the token needs Contents: write on <repo>`).
+   - **Fix PR:** in the base repo (fork repo for fork PRs), from `ci-fix/pr-<N>` into the
+     original PR's branch, title `ci-fix: fixes for #N — <PR title>` (≤120 chars). An open
+     fix PR from that branch is **updated** (title + body) instead of opening another — only
+     if it is ci-fix's (body has `Generated by ci-fix` or its author is the token's user);
+     an open PR from that branch that is not ci-fix's → `GitHubError` (`already exists and
+     was not created by ci-fix`).
+     API 403/404/422 → `GitHubError` with a hint (`the token needs Pull requests: write`).
+   - **Comment** (`comment_on_pr`, default on) on the original PR: link to the fix PR + one
+     line per test. It starts with the marker `<!-- ci-fix -->`; a re-run **edits** the
+     first comment that starts with the marker and is by the token's user (if the user
+     cannot be determined, e.g. app tokens, the marker alone decides) instead of adding one. A failed comment is a WARNING + `FixResult.warnings`
+     entry (the fix PR is already delivered); fork PRs without push get no comment.
+   - INFO lines: `[deliver] squashed ... into commit X`, `pushed branch`, `opened/updated
+     fix PR <url>`, `commented on #N`.
 
 Per-run handles (workspace, test runner) live in a `RunContext` passed through the
 LangGraph config; `PipelineDeps` is immutable, so one `deps` can serve concurrent runs.
@@ -282,13 +322,37 @@ disable or work around it.
 
 ## Commit message & PR description
 
-- Concise; a person should understand it in **2–3 minutes**.
-- Structure:
-  - **Summary** — one or two sentences.
-  - **Fixed** — per test: root cause (one line) → what changed (one line), files.
-  - **Test files changed** (if any) — with justification.
-  - **Unfixable** — per test: the reason.
-  - **Verification** — what was re-run and the result.
+- Concise; a person should understand it in **2–3 minutes**. Built by `ci_fix/report.py`
+  (pure functions); empty sections are left out.
+- **Untrusted text** (explanations, reasons, `Test change:` lines, test-change before/after,
+  warnings — anything from the LLM or test output) is sanitized (`report.sanitize`): HTML
+  comments and HTML-element tags stripped (Python's `<module>`/`<lambda>` kept), a
+  zero-width space after `@` (no mentions) and before the `#` of closing keywords
+  (`fixes #N`, `closes owner/repo#N`, …; no auto-close). ci-fix's own strings are not.
+- **Length cap:** PR body, comments and commit message ≤ 60,000 chars, cut at a line
+  boundary with `… (truncated; N more characters)`.
+- Ids containing a backtick use a double-backtick code span.
+- Commit title: `ci-fix: fix <k> failing test(s) in #N`. The commit body uses plain
+  `Fixed:`-style labels (git-friendly); the PR body starts with
+  `Fixes failing tests in #N (`head_ref`).` and uses `###` headers.
+- Sections, in order:
+  - **Summary** — k fixed, u unfixable, files touched.
+  - **Fixed** — per test: the `Root cause:` and `Fix:` lines of the accepted attempt's
+    explanation (else its first 2 lines; ≤3 lines), then `Files: ...`. Side-effect fixes:
+    "Fixed by the fix for X".
+  - **Test changes (⚠ review: test expectations changed)** — `path::test: before → after`
+    plus the `Test change:` justification line.
+  - **Source changes** — tests whose fix changed source: "changed source code; developer
+    context may be missing — please review".
+  - **Unfixable** — per test: reason (≤300 chars) and attempts.
+  - **Not found / ambiguous** — per requested name.
+  - **Already passing (not touched)**.
+  - **Pre-existing failures (not addressed)** — from the regression baseline (≤20 listed).
+  - **Warnings** — `FixResult.warnings`.
+  - **Verification** — requested tests re-run after every fix; full suite checked (if a
+    baseline was taken, `FixResult.full_suite_checked`); integrity checks: patch checker
+    (+ Claude reviewer when enabled).
+  - Footer: `Generated by ci-fix for #N (<original PR url>).`
 - Add short code comments at each fix site only where the *why* is not obvious.
 
 ---
@@ -311,11 +375,12 @@ disable or work around it.
 fill in the values. Secrets come from the environment:
 
 - `ANTHROPIC_API_KEY`
-- `GITHUB_TOKEN` (needs repo + pull request write access)
+- `GITHUB_TOKEN` (needs Contents: write and Pull requests: write on the repo — on the fork
+  for fork PRs)
 
 Configurable: model name, temperature, max attempts, parallel worker count,
 workspace directory, pytest extra arguments, full-suite (regression) pytest arguments
-and timeout.
+and timeout, delivery (`push`, `comment_on_pr`, `commit_author_name`, `commit_author_email`).
 
 ---
 
@@ -328,6 +393,8 @@ src/ci_fix/
   config.py
   models.py          # FixResult, TestOutcome, PipelineState
   graph.py           # LangGraph wiring
+  report.py          # commit message, PR body, PR comments (pure functions)
+  delivery.py        # squash commit, push, open/update fix PR, comment (deliver node)
   nodes/             # setup_repo, run_tests, triage, fix, verify, regression, finalize
   tools/             # git.py, github.py, pytest_runner.py, agent_tools.py
   guards/              # patch_checker.py (integrity rules), reviewer.py (optional LLM review)

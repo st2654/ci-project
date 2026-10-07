@@ -4,6 +4,7 @@ from ci_fix.tools.git import GitError, GitRepo, run_git
 from ci_fix.tools.github import (
     GitHubClient,
     GitHubError,
+    PullRef,
     PullRequestInfo,
     RepoRef,
     parse_repo_url,
@@ -24,6 +25,7 @@ __all__ = [
     "GitHubClient",
     "GitHubError",
     "GitRepo",
+    "PullRef",
     "PullRequestInfo",
     "PytestRunner",
     "RepoRef",

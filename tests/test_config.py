@@ -160,7 +160,7 @@ temperature = 0.3
 max_attempts = 5
 max_parallel_workers = 2
 workspace_dir = "~/somewhere/else"
-branch_prefix = "fix/"
+branch_prefix = "ci-fix-alt/"
 pytest_args = ["-x", "-q"]
 regression_pytest_args = ["-m", "not slow"]
 regression_timeout_seconds = 60
@@ -173,7 +173,7 @@ regression_timeout_seconds = 60
     assert s.max_attempts == 5
     assert s.max_parallel_workers == 2
     assert s.workspace_dir == Path("~/somewhere/else").expanduser()
-    assert s.branch_prefix == "fix/"
+    assert s.branch_prefix == "ci-fix-alt/"
     assert s.pytest_args == ["-x", "-q"]
     assert s.regression_pytest_args == ["-m", "not slow"]
     assert s.regression_timeout_seconds == 60
@@ -351,3 +351,18 @@ def test_temperature_default_means_not_sent(tmp_path: Path, value: str) -> None:
     s = load_settings(cfg, env={})
     assert s.temperature is None
     assert s.model == "claude-sonnet-5-5"
+
+
+@pytest.mark.parametrize("prefix", ["fix/", "main", "feature/ci-fix-", "CI-FIX/"])
+def test_branch_prefix_must_start_with_ci_fix(tmp_path: Path, prefix: str) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[ci_fix]\nbranch_prefix = "{prefix}"\n')
+    with pytest.raises(ConfigError, match="ci-fix"):
+        load_settings(cfg, env={})
+
+
+@pytest.mark.parametrize("prefix", ["ci-fix/pr-", "ci-fix-bot/"])
+def test_branch_prefix_ci_fix_accepted(tmp_path: Path, prefix: str) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[ci_fix]\nbranch_prefix = "{prefix}"\n')
+    assert load_settings(cfg, env={}).branch_prefix == prefix

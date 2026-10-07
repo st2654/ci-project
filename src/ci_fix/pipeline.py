@@ -32,7 +32,8 @@ def fix_failing_tests(
 
     If ``deps`` is given it is used as-is (``settings``/``fixer``/``github`` are ignored);
     it holds no per-run state, so one ``deps`` can serve concurrent runs.
-    The workspace is always cleaned up (unless ``keep_workspace``), even when a step raises.
+    The workspace is always cleaned up (unless ``keep_workspace``), even when a step raises;
+    delivery (squash commit, push, fix PR, comment; see :mod:`ci_fix.delivery`) runs before.
     """
     if isinstance(failing_tests, str):
         raise ValueError("failing_tests must be a sequence of test names, not a string")
@@ -90,6 +91,12 @@ def fix_failing_tests(
         diff=final.diff,
         summary=final.summary,
         tests=tests,
+        pr_url=final.pr_url,
+        commit_sha=final.commit_sha,
+        commit_message=final.commit_message,
+        pr_body=final.pr_body,
+        pushed=final.pushed,
+        full_suite_checked=final.full_suite_checked,
         preexisting_failures=final.preexisting_failures,
         warnings=final.warnings,
     )

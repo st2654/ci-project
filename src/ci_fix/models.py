@@ -108,7 +108,15 @@ class FixResult(BaseModel):
     diff: str
     summary: str
     tests: list[TestOutcome]  # in the order the user passed the names
+    # Delivery (slice 8). ``pr_url`` is the opened/updated fix PR (None: dry run, nothing
+    # fixed, or a fork PR that cannot be pushed to).
     pr_url: str | None = None
+    commit_sha: str | None = None  # the squashed fix commit (also set in a dry run)
+    commit_message: str = ""
+    pr_body: str = ""  # the fix PR description (built even when nothing is pushed)
+    pushed: bool = False
+    # A full-suite regression baseline was taken (a fix changed source/shared test code).
+    full_suite_checked: bool = False
     # Tests outside the requested ones that already failed before any source change
     # (from the full-suite regression baseline; [] when no source file was changed).
     preexisting_failures: list[str] = Field(default_factory=list)

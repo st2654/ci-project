@@ -76,7 +76,9 @@ def test_independent_bugs_fixed_in_parallel_with_real_pytest(
         assert (run_dir / "worktrees").resolve() in repo_path.resolve().parents
         assert status == TestStatus.PASSED
 
-    log = git("log", "--format=%s", "--reverse", f"{remote.pr_sha}..HEAD", cwd=main)
+    log = git(
+        "log", "--format=%s", "--reverse", f"{remote.pr_sha}..refs/ci-fix/checkpoints", cwd=main
+    )
     assert log.splitlines() == [
         f"ci-fix: fix {SUBTRACT} (attempt 1)",
         f"ci-fix: fix {SHOUT} (attempt 1)",

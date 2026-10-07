@@ -63,7 +63,7 @@ def test_second_attempt_after_wrong_edit(tmp_path: Path, sample_remote: SampleRe
     assert "15" in prev.rejection_reason  # subtract(5, 3) returned 5 * 3
 
     repo = run_dir_for(tmp_path) / "repo"
-    log = git("log", "--format=%s", f"{sample_remote.pr_sha}..HEAD", cwd=repo)
+    log = git("log", "--format=%s", f"{sample_remote.pr_sha}..refs/ci-fix/checkpoints", cwd=repo)
     assert log.splitlines() == [f"ci-fix: fix {SUBTRACT} (attempt 2)"]
 
 

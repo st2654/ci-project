@@ -34,6 +34,7 @@ class Settings(BaseModel):
     max_attempts: int = Field(default=3, ge=1)
     max_parallel_workers: int = Field(default=4, ge=1)
     workspace_dir: Path = Field(default=Path("~/.ci-fix/workspaces"), validate_default=True)
+    # Must start with "ci-fix" (the branch is force-pushed; see delivery guards).
     branch_prefix: str = Field(default="ci-fix/pr-", min_length=1)
     pytest_args: list[str] = Field(default_factory=list)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -51,6 +52,13 @@ class Settings(BaseModel):
     read_max_lines: int = Field(default=400, ge=50)
     # Ask a second LLM call to approve test-file changes (after the patch checker passes).
     review_test_changes: bool = False
+    # Delivery: False = dry run (squash commit + texts, but no push, PR or comment).
+    push: bool = True
+    # Comment on the original PR (link to the fix PR, or why nothing could be fixed).
+    comment_on_pr: bool = True
+    # Identity of the squashed fix commit (author and committer).
+    commit_author_name: str = Field(default="ci-fix", min_length=1)
+    commit_author_email: str = Field(default="ci-fix@users.noreply.github.com", min_length=3)
     anthropic_api_key: SecretStr | None = None
     github_token: SecretStr | None = None
 
@@ -59,6 +67,14 @@ class Settings(BaseModel):
     def _default_temperature(cls, value: object) -> object:
         if isinstance(value, str) and value.strip().lower() in {"default", "none", ""}:
             return None
+        return value
+
+    @field_validator("branch_prefix", mode="after")
+    @classmethod
+    def _ci_fix_branch(cls, value: str) -> str:
+        # The fix branch is force-pushed: it must be clearly ci-fix's own, never a user branch.
+        if not value.startswith("ci-fix"):
+            raise ValueError("branch_prefix must start with 'ci-fix'")
         return value
 
     @field_validator("workspace_dir", "log_file", mode="after")

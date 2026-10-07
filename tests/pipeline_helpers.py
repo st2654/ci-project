@@ -127,6 +127,8 @@ def make_deps(
     **settings_overrides: Any,
 ) -> PipelineDeps:
     """Deps for the sample remote. ``runner_factory=None`` runs the real pytest."""
+    # The shared sample remote must never be written to: no push unless a test asks for it.
+    settings_overrides.setdefault("push", False)
     settings = Settings(workspace_dir=tmp_path / "ws", **settings_overrides)
     github = MagicMock()
     github.get_pull_request.side_effect = lambda ref, number: sample_pr_info(remote, number)

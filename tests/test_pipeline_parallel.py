@@ -85,7 +85,9 @@ def _by_id(result: FixResult) -> dict[str, TestOutcome]:
 
 def _checkpoints(tmp_path: Path, remote: SampleRemote) -> list[str]:
     repo = run_dir_for(tmp_path) / "repo"
-    log = git("log", "--format=%s", "--reverse", f"{remote.pr_sha}..HEAD", cwd=repo)
+    log = git(
+        "log", "--format=%s", "--reverse", f"{remote.pr_sha}..refs/ci-fix/checkpoints", cwd=repo
+    )
     return log.splitlines()
 
 

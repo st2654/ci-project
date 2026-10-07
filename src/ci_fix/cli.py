@@ -9,7 +9,7 @@ from pathlib import Path
 from ci_fix import __version__
 from ci_fix.config import ConfigError, load_settings
 from ci_fix.logging_setup import configure_logging, get_logger
-from ci_fix.models import FixerFatalError, OutcomeStatus
+from ci_fix.models import FixerFatalError, FixResult, OutcomeStatus
 from ci_fix.pipeline import fix_failing_tests
 from ci_fix.tools.git import GitError
 from ci_fix.tools.github import GitHubError
@@ -54,7 +54,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-workspace", action="store_true", help="do not delete the workspace afterwards"
     )
+    parser.add_argument(
+        "--no-push",
+        action="store_true",
+        help="dry run: build the fix commit and PR description, but push/open/comment nothing",
+    )
+    parser.add_argument(
+        "--no-comment", action="store_true", help="do not comment on the original PR"
+    )
     return parser
+
+
+def delivery_line(result: FixResult, push: bool) -> str:
+    """One line saying where the fixes went (fix PR URL, dry run, no fixes, not pushed)."""
+    if result.pr_url:
+        return f"Fix PR: {result.pr_url}"
+    if not result.fixed:
+        return "No fixes: nothing was committed, pushed or opened."
+    if not push:
+        sha = f" {result.commit_sha[:12]}" if result.commit_sha else ""
+        return f"Dry run: fix commit{sha} built locally; nothing pushed (see result.diff)."
+    return "Fixes not pushed (see Warnings); the diff is in the result."
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,6 +93,10 @@ def main(argv: list[str] | None = None) -> int:
         overrides["log_file"] = args.log_file.expanduser()
     if args.keep_workspace:
         overrides["keep_workspace"] = True
+    if args.no_push:
+        overrides["push"] = False
+    if args.no_comment:
+        overrides["comment_on_pr"] = False
     if overrides:
         settings = settings.model_copy(update=overrides)
 
@@ -97,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ci-fix: unexpected error: {type(exc).__name__}: {first_line}", file=sys.stderr)
         return EXIT_ERROR
 
+    print(delivery_line(result, settings.push))
+    print()
     print(result.summary)
     if all(t.status in _SUCCESS for t in result.tests):
         return EXIT_OK

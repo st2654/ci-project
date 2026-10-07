@@ -18,7 +18,8 @@ max_attempts = 3
 max_parallel_workers = 4
 # Directory where repositories are cloned and worktrees are created (~ is expanded).
 workspace_dir = "~/.ci-fix/workspaces"
-# Prefix for the patch branch; the PR number is appended.
+# Prefix for the patch branch; the PR number is appended. Must start with "ci-fix"
+# (the branch is force-pushed, so it must never be a branch people work on).
 branch_prefix = "ci-fix/pr-"
 # Extra arguments passed to pytest when running the target tests.
 pytest_args = []
@@ -49,6 +50,16 @@ read_max_lines = 400
 # Integrity: after an attempt that changed a test file passes the patch checker and the
 # re-run, ask Claude (one extra call) whether the test change is legitimate.
 review_test_changes = false
+# Delivery: squash the accepted fixes into one commit, push branch ci-fix/pr-<N> and open
+# (or update) a PR targeting the original PR's branch. false = dry run: the commit, commit
+# message and PR description are built but nothing is pushed, opened or commented.
+push = true
+# Comment on the original PR with a link to the fix PR (or why nothing could be fixed).
+# A re-run edits its earlier comment instead of adding a new one.
+comment_on_pr = true
+# Author/committer of the squashed fix commit.
+commit_author_name = "ci-fix"
+commit_author_email = "ci-fix@users.noreply.github.com"
 # Console log level: DEBUG, INFO, WARNING or ERROR. INFO shows pipeline progress.
 log_level = "INFO"
 # Optional file that receives full DEBUG logs for troubleshooting (~ is expanded).

@@ -1,6 +1,6 @@
 """LangGraph wiring for the fix pipeline.
 
-setup → resolve → run_initial → select_next ⇄ fix_one → verify_one → … → finalize
+setup → resolve → run_initial → select_next ⇄ fix_one → verify_one → … → finalize → deliver
 
 Failing tests are fixed one at a time. Every attempt is verified against ALL requested
 tests: an accepted attempt becomes a local checkpoint commit, a rejected one is rolled back
@@ -12,6 +12,10 @@ independent groups (see :mod:`ci_fix.triage`), a round runs one fixer per group 
 worktree (``plan_round`` → ``fix_in_worktree`` via ``Send``); ``merge_candidates`` then applies
 each candidate patch to the main checkout and judges it serially, exactly like a sequential
 attempt. A patch that no longer applies is retried sequentially.
+
+``finalize`` builds the diff, the commit message and the PR description; ``deliver`` squashes
+the checkpoints into one commit, pushes the branch, opens/updates the fix PR and comments on
+the original PR (see :mod:`ci_fix.delivery`).
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from langgraph.types import Send
 from pydantic import BaseModel, ConfigDict, Field
 
 from ci_fix.config import Settings
+from ci_fix.delivery import deliver as deliver_fixes
 from ci_fix.guards.patch_checker import CheckContext, PatchReport, check_patch
 from ci_fix.guards.reviewer import TestChangeReviewer
 from ci_fix.logging_setup import get_logger
@@ -39,6 +44,7 @@ from ci_fix.models import (
     OutcomeStatus,
     TestOutcome,
 )
+from ci_fix.report import ReportData, build_commit_message, build_pr_body
 from ci_fix.tools.git import GitError, GitRepo
 from ci_fix.tools.github import GitHubClient
 from ci_fix.tools.pytest_runner import (
@@ -223,6 +229,13 @@ class PipelineState(BaseModel):
     serial_queue: list[str] = Field(default_factory=list)
     diff: str = ""
     summary: str = ""
+    # Set by finalize / deliver (slice 8).
+    full_suite_checked: bool = False
+    commit_message: str = ""
+    pr_body: str = ""
+    commit_sha: str | None = None
+    pushed: bool = False
+    pr_url: str | None = None
 
 
 def recursion_limit(settings: Settings, n_tests: int) -> int:
@@ -233,7 +246,7 @@ def recursion_limit(settings: Settings, n_tests: int) -> int:
     Every candidate either uses up an attempt or, if its patch does not apply, is queued for a
     sequential retry (3 steps) that does. Worst case a round with one candidate that does not
     apply: 4 + 3 = 7 steps for one attempt, so 7 per attempt bounds parallel runs. 20 covers
-    the fixed steps (setup, resolve, run, final select_next, finalize).
+    the fixed steps (setup, resolve, run, final select_next, finalize, deliver).
     """
     per_attempt = 7 if settings.max_parallel_workers > 1 else 3
     return n_tests * settings.max_attempts * per_attempt + 20
@@ -403,19 +416,29 @@ def truncate_text(text: str, max_chars: int) -> str:
     return f"{text[:keep]}\n[... truncated {len(text) - keep} chars]"
 
 
-def build_summary(state: PipelineState) -> str:
-    """Placeholder markdown summary: one line per requested test."""
-    lines = [f"## ci-fix results for PR #{state.pr_number}", ""]
+def report_data(state: PipelineState, reviewer_enabled: bool) -> ReportData:
+    """What the commit message, PR description and comments are built from."""
+    pr = state.prepared.pr if state.prepared is not None else None
+    tests = []
     for name in state.requested:
-        outcome = state.outcomes.get(name)
-        if outcome is None:
-            lines.append(f"- `{name}`: no outcome recorded")
-            continue
-        line = f"- `{name}`: **{outcome.status.value}**"
-        if outcome.reason:
-            line += f" — {outcome.reason}"
-        lines.append(line)
-    return "\n".join(lines) + "\n"
+        outcome = state.outcomes.get(name) or TestOutcome(
+            requested_name=name,
+            node_id=state.name_to_id.get(name),
+            status=OutcomeStatus.UNFIXABLE,
+            reason="no outcome recorded",
+        )
+        tests.append(outcome)
+    return ReportData(
+        pr_number=state.pr_number,
+        pr_title=pr.title if pr else "",
+        pr_url=pr.html_url if pr else "",
+        head_ref=pr.head_ref if pr else "",
+        tests=tests,
+        preexisting_failures=state.preexisting_failures,
+        warnings=state.warnings,
+        full_suite_checked=state.full_suite_checked,
+        reviewer_enabled=reviewer_enabled,
+    )
 
 
 def build_graph(deps: PipelineDeps) -> Any:
@@ -1140,7 +1163,6 @@ def build_graph(deps: PipelineDeps) -> Any:
         if state.prepared is not None:
             # The worktree is clean: the diff is exactly the accepted checkpoint commits.
             diff = _ctx(config).repo.diff(state.prepared.pr_head_sha)
-        summary = build_summary(state)
         preexisting: list[str] = []
         if state.regression_baseline is not None:
             preexisting = preexisting_failures(state.regression_baseline, _unique_ids(state))
@@ -1157,7 +1179,46 @@ def build_graph(deps: PipelineDeps) -> Any:
             ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no outcomes",
             len(diff.splitlines()),
         )
-        return {"diff": diff, "summary": summary, "preexisting_failures": preexisting}
+        full_suite_checked = state.regression_baseline is not None
+        data = report_data(
+            state.model_copy(
+                update={
+                    "preexisting_failures": preexisting,
+                    "full_suite_checked": full_suite_checked,
+                }
+            ),
+            reviewer_enabled=deps.reviewer is not None,
+        )
+        pr_body = build_pr_body(data)
+        return {
+            "diff": diff,
+            "summary": pr_body,
+            "pr_body": pr_body,
+            "commit_message": build_commit_message(data),
+            "preexisting_failures": preexisting,
+            "full_suite_checked": full_suite_checked,
+        }
+
+    def deliver(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
+        if state.prepared is None:
+            return {}
+        outcome = deliver_fixes(
+            _ctx(config).repo,
+            state.prepared,
+            settings,
+            deps.github,
+            report_data(state, reviewer_enabled=deps.reviewer is not None),
+            state.commit_message,
+            state.pr_body,
+        )
+        return {
+            "commit_sha": outcome.commit_sha,
+            "pushed": outcome.pushed,
+            "pr_url": outcome.pr_url,
+            "pr_body": outcome.pr_body,
+            "summary": outcome.pr_body,
+            "warnings": [*state.warnings, *outcome.warnings],
+        }
 
     def after_resolve(state: PipelineState) -> str:
         return "run_initial" if state.name_to_id else "finalize"
@@ -1186,6 +1247,7 @@ def build_graph(deps: PipelineDeps) -> Any:
     graph.add_node("fix_in_worktree", fix_in_worktree)
     graph.add_node("merge_candidates", merge_candidates)
     graph.add_node("finalize", finalize)
+    graph.add_node("deliver", deliver)
 
     graph.add_edge(START, "setup_repo")
     graph.add_edge("setup_repo", "setup_env")
@@ -1198,5 +1260,6 @@ def build_graph(deps: PipelineDeps) -> Any:
     graph.add_conditional_edges("plan_round", fan_out, ["fix_in_worktree"])
     graph.add_edge("fix_in_worktree", "merge_candidates")
     graph.add_edge("merge_candidates", "select_next")
-    graph.add_edge("finalize", END)
+    graph.add_edge("finalize", "deliver")
+    graph.add_edge("deliver", END)
     return graph.compile()

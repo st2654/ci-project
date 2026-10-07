@@ -557,7 +557,9 @@ def test_baseline_run_rewriting_tracked_file_does_not_block_restore(
 
 def _commits(tmp_path: Path, remote: SampleRemote) -> list[str]:
     repo = run_dir_for(tmp_path) / "repo"
-    return git("log", "--format=%s", f"{remote.pr_sha}..HEAD", cwd=repo).splitlines()
+    return git(
+        "log", "--format=%s", f"{remote.pr_sha}..refs/ci-fix/checkpoints", cwd=repo
+    ).splitlines()
 
 
 def test_failed_unstash_rejects_attempt_and_keeps_checkpoints(

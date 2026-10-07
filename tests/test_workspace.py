@@ -49,7 +49,7 @@ def test_prepare_happy_path(fake_remote: FakeRemote, settings: Settings) -> None
 
 
 def test_prepare_uses_branch_prefix(fake_remote: FakeRemote, tmp_path: Path) -> None:
-    settings = Settings(workspace_dir=tmp_path / "ws", branch_prefix="fix/")
+    settings = Settings(workspace_dir=tmp_path / "ws", branch_prefix="ci-fix-alt/")
     prepared = prepare_pr_checkout(
         REPO_URL,
         fake_remote.pr_number,
@@ -57,7 +57,7 @@ def test_prepare_uses_branch_prefix(fake_remote: FakeRemote, tmp_path: Path) -> 
         fake_client(pr_info(fake_remote)),
         clone_url=fake_remote.url,
     )
-    assert prepared.branch == f"fix/{fake_remote.pr_number}"
+    assert prepared.branch == f"ci-fix-alt/{fake_remote.pr_number}"
     assert git("symbolic-ref", "HEAD", cwd=Path(prepared.path)) == f"refs/heads/{prepared.branch}"
 
 

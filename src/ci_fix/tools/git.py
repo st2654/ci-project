@@ -274,6 +274,85 @@ class GitRepo:
         log.debug("Checkpoint %s: %s", sha[:12], message)
         return sha
 
+    def squash(
+        self,
+        base: str,
+        message: str,
+        author_name: str,
+        author_email: str,
+        keep_ref: str | None = None,
+    ) -> str | None:
+        """Replace the commits since ``base`` by one commit with ``message``; return its SHA.
+
+        ``git reset --soft base`` keeps the combined changes staged; they are committed with
+        the given identity (author and committer), hooks skipped, no signing. Returns None
+        (and leaves HEAD at ``base``) when there is nothing to commit. ``keep_ref`` (e.g.
+        ``refs/ci-fix/checkpoints``) is first pointed at the old HEAD, so the squashed
+        commits stay inspectable.
+        """
+        if keep_ref:
+            self._git("update-ref", keep_ref, "HEAD")
+        self._git("reset", "--soft", "-q", base)
+        if not self._git("diff", "--cached", "--name-only"):
+            log.debug("Squash skipped: nothing to commit on top of %s", base[:12])
+            return None
+        identity = ("-c", f"user.name={author_name}", "-c", f"user.email={author_email}")
+        self._git(
+            *identity, "-c", "commit.gpgsign=false", "commit", "--no-verify", "-q", "-m", message
+        )
+        sha = self.head_sha()
+        log.debug("Squashed commits since %s into %s", base[:12], sha[:12])
+        return sha
+
+    def remote_branch_exists(self, remote: str, branch: str, token: str | None = None) -> bool:
+        """Whether ``refs/heads/<branch>`` exists on ``remote`` (a remote name or URL)."""
+        out = self._git("ls-remote", "--heads", remote, f"refs/heads/{branch}", token=token)
+        return bool(out.strip())
+
+    def fetch_remote_branch(self, remote: str, branch: str, token: str | None = None) -> str:
+        """Fetch ``branch`` from ``remote`` into ``refs/ci-fix-fetch/existing``; return its SHA."""
+        ref = "refs/ci-fix-fetch/existing"
+        self._git("fetch", "-q", "--no-tags", remote, f"+refs/heads/{branch}:{ref}", token=token)
+        return self._git("rev-parse", ref)
+
+    def commit_author_and_subject(self, rev: str) -> tuple[str, str]:
+        """``(author email, subject line)`` of commit ``rev``."""
+        out = self._git("log", "-1", "--format=%ae%x00%s", rev)
+        email, _, subject = out.partition("\0")
+        return email, subject
+
+    def push(
+        self,
+        remote: str,
+        local_ref: str,
+        remote_branch: str,
+        token: str | None = None,
+        force: bool = True,
+        label: str | None = None,
+    ) -> None:
+        """Push ``local_ref`` to ``refs/heads/<remote_branch>`` on ``remote`` (name or URL).
+
+        ``label`` names the target repo in error messages (default: the remote, without
+        credentials). A permission error gets a hint about the token's scope.
+        """
+        args = ["push", "-q", "--no-verify"]
+        if force:
+            args.append("--force")
+        args += [remote, f"{local_ref}:refs/heads/{remote_branch}"]
+        try:
+            self._git(*args, token=token)
+        except GitError as exc:
+            target = label or _safe_url(remote)
+            msg = f"push of {remote_branch} to {target} failed: {exc}"
+            lowered = str(exc).lower()
+            if any(
+                s in lowered
+                for s in ("403", "permission", "denied", "authentication", "not allowed")
+            ):
+                msg += f"\nhint: the token needs Contents: write on {target}"
+            raise GitError(msg) from None
+        log.debug("Pushed %s to %s:%s", local_ref, _safe_url(remote), remote_branch)
+
     def rollback(self) -> None:
         """Discard all uncommitted changes and untracked files (gitignored files are kept)."""
         self.reset_hard()
