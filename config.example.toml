@@ -21,6 +21,15 @@ branch_prefix = "ci-fix/pr-"
 pytest_args = []
 # Command for the full regression suite, run only when source files changed.
 regression_command = ["pytest"]
+# Python version for the test environment when the target repo has no .python-version file.
+python_version = "3.11"
+# Optional custom dependency install command, run in the repo with the test venv active.
+# When unset, ci-fix detects uv.lock, pyproject.toml/setup.py, or requirements files.
+# install_command = ["uv", "pip", "install", "-e", ".[test]"]
+# Timeout in seconds for each environment setup command and each pytest run.
+test_timeout_seconds = 900
+# Keep the run directory (clone, venv, JUnit reports) after the run, for debugging.
+keep_workspace = false
 # Console log level: DEBUG, INFO, WARNING or ERROR. INFO shows pipeline progress.
 log_level = "INFO"
 # Optional file that receives full DEBUG logs for troubleshooting (~ is expanded).

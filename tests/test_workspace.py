@@ -29,7 +29,9 @@ def test_prepare_happy_path(fake_remote: FakeRemote, settings: Settings) -> None
         RepoRef(owner="octo", name="repo"), fake_remote.pr_number
     )
 
-    expected = settings.workspace_dir / f"octo__repo__pr-{fake_remote.pr_number}"
+    run_dir = settings.workspace_dir / f"octo__repo__pr-{fake_remote.pr_number}"
+    expected = run_dir / "repo"
+    assert Path(prepared.run_dir) == run_dir
     assert Path(prepared.path) == expected
     assert prepared.repo == RepoRef(owner="octo", name="repo")
     assert prepared.pr == pr_info(fake_remote)
@@ -82,7 +84,8 @@ def test_prepare_rerun_over_non_git_dir(fake_remote: FakeRemote, settings: Setti
         fake_client(pr_info(fake_remote)),
         clone_url=fake_remote.url,
     )
-    assert not (Path(prepared.path) / "junk.txt").exists()
+    assert Path(prepared.run_dir) == dest
+    assert not (dest / "junk.txt").exists()
 
 
 @pytest.mark.parametrize("state", ["closed", "merged"])

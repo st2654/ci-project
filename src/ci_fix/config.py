@@ -37,6 +37,10 @@ class Settings(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_file: Path | None = None
     regression_command: list[str] = Field(default_factory=lambda: ["pytest"], min_length=1)
+    python_version: str = Field(default="3.11", min_length=1)
+    install_command: list[str] | None = None
+    test_timeout_seconds: int = Field(default=900, ge=1)
+    keep_workspace: bool = False
     anthropic_api_key: SecretStr | None = None
     github_token: SecretStr | None = None
 

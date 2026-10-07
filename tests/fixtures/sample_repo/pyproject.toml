@@ -1,0 +1,19 @@
+[project]
+name = "sample-calc"
+version = "0.1.0"
+description = "Tiny calculator with seeded bugs, used as a ci-fix test fixture."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/calc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

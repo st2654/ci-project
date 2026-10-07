@@ -35,7 +35,9 @@ opens a PR with a concise, human-readable description.
 | What a fix may change | Test files **and** source code. A source change must fix the real bug, never special-case the test (see "Integrity rules"). |
 | Delivery | Push patch branch `ci-fix/pr-<N>` and **open a PR targeting the original PR's branch** (the fix layers on top of that PR) |
 | Fork PRs | If the PR comes from a fork: push the fix to the fork's branch **only when** `maintainer_can_modify` is true and the token has access; otherwise skip the push/PR and return the fix as a diff with a clear message. |
-| Execution | Run tests **locally** on the host for now. Docker sandbox is a future slice. |
+| Execution | Run tests **locally** (Docker postponed). Each PR gets its own workspace `<workspace_dir>/<owner>__<repo>__pr-<N>/` with `repo/`, `venv/` (separate uv venv) and `reports/`; it is **deleted at the end of the run** unless `keep_workspace = true`. |
+| Target-repo isolation | PR code runs with an **allowlisted environment**: its own venv, no `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`/`PYTHON*`/`CI_FIX_*`. Timeouts kill the whole process group. |
+| Test names | Full pytest node ids are used as given; bare names (`test_a`, `Cls::test_a`) are resolved via `pytest --collect-only`. Ambiguous or unknown names are reported, never guessed. |
 | Fix attempts | **3** fix → re-test rounds per test, then report it as unfixable |
 | Regression runs | Run the **full test suite** **only if the fix changed source code** (non-test files). Test-only fixes re-run just the target tests. |
 | Secrets/config | Loaded from `config` + environment; the user fills in values (see "Configuration") |
