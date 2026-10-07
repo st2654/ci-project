@@ -52,7 +52,6 @@ from pipeline_helpers import (
     run_dirs_for,
 )
 
-from ci_fix.graph import DELETED_REASON, SKIPPED_AFTER_FIX_REASON
 from ci_fix.models import FixAttempt, FixRequest, FixResult, NoOpFixer, OutcomeStatus, TestOutcome
 from ci_fix.pipeline import fix_failing_tests
 from ci_fix.tools.git import GitError
@@ -223,18 +222,20 @@ def test_fix_for_one_test_also_fixes_another(run) -> None:
 @pytest.mark.parametrize(
     ("action", "reason"),
     [
-        (DELETE_SUBTRACT_TEST, DELETED_REASON),
+        (DELETE_SUBTRACT_TEST, "test_removed"),
         (
             ("edit", TEST_OPS_PY, SUBTRACT_TEST, "@pytest.mark.skip\n" + SUBTRACT_TEST, "skip"),
-            SKIPPED_AFTER_FIX_REASON,
+            "skip_added",
         ),
     ],
 )
 def test_deleting_or_skipping_target_is_rejected(run, action, reason: str) -> None:
+    # Slice 5: the patch checker rejects these before verification runs.
     result = run(ScriptedFixer({SUBTRACT: [action]}), [SUBTRACT], max_attempts=1)
     outcome = _only(result)
     assert outcome.status == OutcomeStatus.UNFIXABLE
-    assert outcome.reason == f"still failing after 1 attempt(s): {reason}"
+    assert outcome.reason.startswith("still failing after 1 attempt(s): integrity check failed:")
+    assert f"[{reason}]" in outcome.reason
     assert result.diff == ""
 
 
@@ -248,7 +249,8 @@ def test_deleting_another_requested_test_is_rejected(run) -> None:
     result = run(fixer, [MEAN, SUBTRACT], max_attempts=1)
     mean = _by_name(result)[MEAN]
     assert mean.status == OutcomeStatus.UNFIXABLE
-    assert f"tests no longer collected after fix: {SUBTRACT}" in mean.reason
+    assert "integrity check failed:" in mean.reason  # slice 5: caught before verification
+    assert "[test_removed]" in mean.reason and "test_subtract" in mean.reason
 
 
 def test_verify_reruns_all_requested_tests(run, runners: FakeRunnerFactory) -> None:

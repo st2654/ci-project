@@ -9,6 +9,7 @@ from typing import Any
 from ci_fix.agent import ClaudeFixer
 from ci_fix.config import Settings, load_settings
 from ci_fix.graph import PipelineDeps, PipelineState, RunContext, build_graph, recursion_limit
+from ci_fix.guards.reviewer import ClaudeReviewer
 from ci_fix.logging_setup import get_logger
 from ci_fix.models import Fixer, FixResult, OutcomeStatus, TestOutcome
 from ci_fix.tools.github import GitHubClient, parse_repo_url
@@ -48,7 +49,8 @@ def fix_failing_tests(
             github = GitHubClient(token)
         if fixer is None:
             fixer = ClaudeFixer(settings)  # raises ConfigError without ANTHROPIC_API_KEY
-        deps = PipelineDeps(settings=settings, github=github, fixer=fixer)
+        reviewer = ClaudeReviewer(settings) if settings.review_test_changes else None
+        deps = PipelineDeps(settings=settings, github=github, fixer=fixer, reviewer=reviewer)
     settings = deps.settings
 
     ref = parse_repo_url(repo_url)

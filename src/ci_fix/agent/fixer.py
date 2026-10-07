@@ -6,17 +6,17 @@ import time
 from collections.abc import Callable
 from typing import Any, Literal
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, ValidationError
 
+from ci_fix.agent.llm import build_chat_model, invoke_or_fatal
 from ci_fix.agent.prompts import SYSTEM_PROMPT, build_user_message
 from ci_fix.agent.tools import RepoTools
-from ci_fix.config import ConfigError, Settings
+from ci_fix.config import Settings
 from ci_fix.logging_setup import get_logger
-from ci_fix.models import FixAttempt, FixerFatalError, FixRequest
+from ci_fix.models import FixAttempt, FixRequest
 
 log = get_logger(__name__)
 
@@ -73,7 +73,8 @@ class FinishArgs(BaseModel):
     )
     explanation: str = Field(
         description="Concise, for the PR description: 'Root cause: ...\\nFix: ...\\n"
-        "Why this file: ...' (about 80 words max). For unfixable: the reason."
+        "Why this file: ...' (about 80 words max), plus a 'Test change: <why the old "
+        "expectation was wrong>' line if a test's expectation changed. For unfixable: the reason."
     )
 
 
@@ -110,46 +111,13 @@ class _Finished(Exception):
         self.args_ = args
 
 
-# HTTP statuses that mean "this request will never succeed": invalid request (incl.
-# unsupported parameters and low credit balance), auth, permission, unknown model.
-_FATAL_STATUS = {400, 401, 403, 404}
-
-
-def _is_fatal_api_error(exc: Exception) -> bool:
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and status in _FATAL_STATUS
-
-
-def _api_error_message(exc: Exception) -> str:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error")
-        if isinstance(err, dict) and err.get("message"):
-            return str(err["message"])
-    return str(exc).splitlines()[0][:300]
-
-
 class ClaudeFixer:
     """``Fixer`` backed by a chat model with repo tools (Claude by default)."""
 
     def __init__(self, settings: Settings, llm: BaseChatModel | None = None) -> None:
         self.settings = settings
         if llm is None:
-            if settings.anthropic_api_key is None:
-                raise ConfigError(
-                    "Missing required environment variable: ANTHROPIC_API_KEY (needed by the "
-                    "Claude fixer)"
-                )
-            kwargs: dict[str, Any] = {
-                "model": settings.model,
-                "max_tokens": settings.max_output_tokens,
-                "api_key": settings.anthropic_api_key.get_secret_value(),
-                "max_retries": 3,
-                "timeout": 120,
-            }
-            if settings.temperature is not None:  # some models reject `temperature`
-                kwargs["temperature"] = settings.temperature
-            llm = ChatAnthropic(**kwargs)
+            llm = build_chat_model(settings)
         self.llm = llm
         try:
             self.llm_with_tools: Any = llm.bind_tools(TOOLS)
@@ -172,15 +140,7 @@ class ClaudeFixer:
         steps = 0
         while steps < max_steps:
             steps += 1
-            try:
-                ai = self.llm_with_tools.invoke(messages)
-            except Exception as exc:
-                if _is_fatal_api_error(exc):
-                    raise FixerFatalError(
-                        f"Claude API rejected the request ({type(exc).__name__}): "
-                        f"{_api_error_message(exc)}"
-                    ) from exc
-                raise
+            ai = invoke_or_fatal(self.llm_with_tools, messages)
             if not isinstance(ai, AIMessage):
                 ai = AIMessage(content=getattr(ai, "content", str(ai)))
             messages.append(ai)

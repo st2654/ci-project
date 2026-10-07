@@ -47,6 +47,8 @@ class Settings(BaseModel):
     max_output_tokens: int = Field(default=4096, ge=256)
     pr_diff_max_chars: int = Field(default=40000, ge=1000)
     read_max_lines: int = Field(default=400, ge=50)
+    # Ask a second LLM call to approve test-file changes (after the patch checker passes).
+    review_test_changes: bool = False
     anthropic_api_key: SecretStr | None = None
     github_token: SecretStr | None = None
 

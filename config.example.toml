@@ -41,6 +41,9 @@ max_output_tokens = 4096
 pr_diff_max_chars = 40000
 # Fixer agent: maximum lines returned by one read_file call.
 read_max_lines = 400
+# Integrity: after an attempt that changed a test file passes the patch checker and the
+# re-run, ask Claude (one extra call) whether the test change is legitimate.
+review_test_changes = false
 # Console log level: DEBUG, INFO, WARNING or ERROR. INFO shows pipeline progress.
 log_level = "INFO"
 # Optional file that receives full DEBUG logs for troubleshooting (~ is expanded).

@@ -123,6 +123,7 @@ def make_deps(
     remote: SampleRemote,
     runner_factory: Any = None,
     env_factory: Any = fake_env_factory,
+    reviewer: Any = None,
     **settings_overrides: Any,
 ) -> PipelineDeps:
     """Deps for the sample remote. ``runner_factory=None`` runs the real pytest."""
@@ -136,6 +137,7 @@ def make_deps(
         fixer=fixer,
         env_factory=env_factory,
         clone_url=remote.url,
+        reviewer=reviewer,
         **extra,
     )
 

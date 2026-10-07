@@ -518,6 +518,7 @@ def test_api_key_never_sent_to_model(settings: Settings, repo: Path) -> None:
 def test_default_llm_is_deterministic_claude(monkeypatch: pytest.MonkeyPatch) -> None:
     """The real model must be built from settings with temperature 0 (deterministic)."""
     import ci_fix.agent.fixer as fixer_module
+    import ci_fix.agent.llm as llm_module
 
     captured: dict = {}
 
@@ -528,7 +529,7 @@ def test_default_llm_is_deterministic_claude(monkeypatch: pytest.MonkeyPatch) ->
         def bind_tools(self, tools, **kwargs):
             return self
 
-    monkeypatch.setattr(fixer_module, "ChatAnthropic", _FakeChatAnthropic)
+    monkeypatch.setattr(llm_module, "ChatAnthropic", _FakeChatAnthropic)
     settings = Settings(anthropic_api_key="sk-test-not-real", max_output_tokens=2048)
     fixer_module.ClaudeFixer(settings)
     assert captured["model"] == "claude-sonnet-4-6"
@@ -542,6 +543,7 @@ def test_default_llm_is_deterministic_claude(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_temperature_none_is_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
     import ci_fix.agent.fixer as fixer_module
+    import ci_fix.agent.llm as llm_module
 
     captured: dict = {}
 
@@ -552,7 +554,7 @@ def test_temperature_none_is_not_sent(monkeypatch: pytest.MonkeyPatch) -> None:
         def bind_tools(self, tools, **kwargs):
             return self
 
-    monkeypatch.setattr(fixer_module, "ChatAnthropic", _FakeChatAnthropic)
+    monkeypatch.setattr(llm_module, "ChatAnthropic", _FakeChatAnthropic)
     settings = Settings(anthropic_api_key="sk-x", model="claude-sonnet-5-5", temperature=None)
     fixer_module.ClaudeFixer(settings)
     assert "temperature" not in captured

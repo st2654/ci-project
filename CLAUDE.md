@@ -152,9 +152,61 @@ The goal is to fix the **real bug**, never to make a test pass by hiding it.
 - Changing a test's expected value only when the test is demonstrably wrong.
   The agent must explain why, and the summary must flag the change.
 
-**Enforcement:** a patch checker runs on every proposed diff and rejects
-any of the forbidden patterns above. A rejected patch counts as a failed
-attempt.
+**Enforcement:**
+- **Patch checker** (`ci_fix/guards/patch_checker.py`, stdlib `ast`, always on) runs
+  right after the fixer returns, comparing every changed `.py` file and pytest config
+  file between `HEAD` and the working tree. Any violation rolls the attempt back and
+  rejects it (`integrity check failed:` + the list of violations, fed back to the agent);
+  it counts as a failed attempt; a checker crash is also a rejection
+  (`integrity check failed: checker error: ...`). Test files are test modules
+  (`python_files` from the pytest config at HEAD, default `test_*.py`/`*_test.py`,
+  plus `conftest.py`) and every `.py` file in a `tests`/`test`/`testing` directory or a
+  configured `testpaths` entry; they never get source rules. Rule ids (also used in the
+  PR description):
+  - any `.py`: `syntax_error`, `unparseable`, `unreadable`.
+  - test files: `test_removed` (test or test class deleted/renamed), `skip_added`,
+    `assertion_removed` (fewer asserts / `assert*` calls / `pytest.raises`),
+    `trivial_assertion`, `test_emptied`, `expects_exception_added` (new
+    `pytest.raises`/`assertRaises*` in a test that had none), `try_added`,
+    `fixture_removed` (test parameter or `@pytest.fixture` removed), `param_removed`
+    (fewer literal parametrize cases), `fixture_stubbed` (an existing fixture or
+    `setUp`/`setup_method`-style method now only returns/yields/assigns a dummy —
+    constant, `None`, `object()`, `Mock()`, empty literal, lambda — or its `raise` was
+    replaced by returning one), `code_under_test_patched` (new `monkeypatch.setattr/
+    setitem`, `mock.patch`/`patch.object`, `setattr`, rebinding imported names — new
+    fixtures included — or importing a name from `mock`/`unittest.mock` or from a `.py`
+    file created by the same patch), `collection_tampering`
+    (`collect_ignore*`/`pytest_plugins` changed, or pytest hooks added/changed: collection,
+    `pytest_runtest_*`, `makereport`, `report_teststatus`, `sessionfinish`, `configure`,
+    `pyfunc_call` — also in modules registered via `pytest_plugins`),
+    `test_data_changed` (binary file in a test directory changed),
+    `unjustified_test_change`.
+  - source files: `test_detection` (new pytest imports; "pytest"/"CI_FIX" strings used in
+    a comparison, `in` test, subscript or lookup call — not in log messages or f-strings;
+    `PYTEST_CURRENT_TEST`; `TESTING` env lookups), `special_case_inputs` (new
+    `==`/`!=`/`in`/`is` comparison of a name with a literal from the failing test's file;
+    `None`/`True`/`False`/`0`/`1`/`-1`/`""` ignored), `hardcoded_return` (an existing
+    function now only returns a literal), `error_swallowed` (new bare/`Exception` handler
+    that passes, continues or returns a constant).
+  - config: `test_config_changed` (`pytest.ini`/`.pytest.ini`, or the pytest section of
+    `tox.ini`, `setup.cfg`, `pyproject.toml`).
+- **`Test change:` requirement:** a changed expectation (an assertion, a tolerance such
+  as `abs=`/`rel=`/`places=`/`delta=`, any other change to an existing fixture or
+  setup/teardown method, a changed or removed import of non-stdlib code in a test file
+  (test `<path>::imports`, e.g. after the PR renamed a function), a changed text file in a
+  test directory (data, snapshots), the
+  literal value assigned to a variable an
+  assertion uses, or a module-level literal in a test file) is allowed only if the
+  fixer's explanation contains a line `Test change: <why the old expectation was wrong>`;
+  otherwise `unjustified_test_change`. Accepted changes are recorded per test
+  (`TestOutcome.test_changes`, `source_changed`, `explanation`) for the PR description.
+- **Optional reviewer** (`review_test_changes = true`, default off): after an attempt
+  that changed a test file passes the checker and verification, one extra Claude call
+  (`ClaudeReviewer`) judges whether every test change is legitimate and rejects when in
+  doubt (`reviewer rejected test change: <reason>`, also a failed attempt). It sees the
+  test-file hunks first and in full; only source hunks are truncated. A reviewer error is
+  retried once; if it fails twice the attempt is rejected (`reviewer unavailable: ...`,
+  counts as an attempt). Fatal API errors stop the run.
 
 **Unfixable tests:** if a test cannot be fixed honestly (e.g. it needs an
 external service or credentials, the requirement is ambiguous, or attempts
@@ -212,7 +264,7 @@ src/ci_fix/
   graph.py           # LangGraph wiring
   nodes/             # setup_repo, run_tests, triage, fix, verify, regression, finalize
   tools/             # git.py, github.py, pytest_runner.py, agent_tools.py
-  guards/patch_checker.py
+  guards/              # patch_checker.py (integrity rules), reviewer.py (optional LLM review)
   prompts/
 tests/
   fixtures/sample_repo/   # small repo with seeded bugs for end-to-end tests

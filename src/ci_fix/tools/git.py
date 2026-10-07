@@ -194,10 +194,37 @@ class GitRepo:
     def changed_files(self) -> list[str]:
         """Sorted paths that differ between the working tree and HEAD (new, modified, deleted).
 
-        Gitignored files are not included.
+        Gitignored files are not included. A rename is listed as both the old and new path.
         """
         self._git("add", "--all", "--intent-to-add")
-        return sorted(set(self._git("diff", "--name-only", "HEAD").splitlines()))
+        out = self._git("diff", "--name-only", "--no-renames", "HEAD")
+        return sorted(set(out.splitlines()))
+
+    def file_bytes_at(self, rev: str, path: str) -> bytes | None:
+        """Raw content of repo-relative ``path`` at commit ``rev`` (None if it is not there)."""
+        argv = ["git", *_SAFE_CONFIG, "show", f"{rev}:{path}"]
+        log.debug("$ git show %s:%s (cwd=%s)", rev, path, self.path)
+        try:
+            proc = subprocess.run(
+                argv, cwd=self.path, env=_git_env(None), capture_output=True, timeout=600
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log.debug("git show failed: %s", exc)
+            return None
+        return proc.stdout if proc.returncode == 0 else None
+
+    def file_at(self, rev: str, path: str) -> str | None:
+        """Text of ``path`` at ``rev`` (invalid UTF-8 replaced); None if it is not there."""
+        data = self.file_bytes_at(rev, path)
+        return data.decode("utf-8", errors="replace") if data is not None else None
+
+    def files_containing(self, text: str, rev: str = "HEAD", pathspec: str = "*.py") -> list[str]:
+        """Paths of files at ``rev`` matching ``pathspec`` that contain ``text`` (fixed string)."""
+        try:
+            out = self._git("grep", "-l", "-F", "-e", text, rev, "--", pathspec)
+        except GitError:  # exit 1 = no match
+            return []
+        return sorted(line.split(":", 1)[1] for line in out.splitlines() if ":" in line)
 
     def checkpoint(self, message: str) -> str | None:
         """Commit every change in the working tree; return the new HEAD, or None if unchanged.

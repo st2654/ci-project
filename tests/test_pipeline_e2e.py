@@ -24,7 +24,6 @@ from pipeline_helpers import (
     run_dirs_for,
 )
 
-from ci_fix.graph import DELETED_REASON
 from ci_fix.models import FixResult, OutcomeStatus
 from ci_fix.pipeline import fix_failing_tests
 
@@ -74,5 +73,7 @@ def test_fix_that_deletes_the_test_is_rejected(tmp_path: Path, sample_remote: Sa
 
     (outcome,) = result.tests
     assert outcome.status == OutcomeStatus.UNFIXABLE
-    assert outcome.reason == f"still failing after 1 attempt(s): {DELETED_REASON}"
+    # Slice 5: the patch checker rejects the deletion before verification runs.
+    assert outcome.reason.startswith("still failing after 1 attempt(s): integrity check failed:")
+    assert "[test_removed]" in outcome.reason
     assert result.diff == ""

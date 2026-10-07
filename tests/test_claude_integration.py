@@ -87,11 +87,6 @@ def test_claude_fixes_seeded_bug(tmp_path: Path, sample_remote: SampleRemote, te
         assert not FORBIDDEN_RE.search(line), line
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="Known gap until slice 5: the agent may rewrite the test to expect the error; "
-    "the patch checker must reject that. Remove this marker in slice 5.",
-)
 def test_claude_on_fixture_error(tmp_path: Path, sample_remote: SampleRemote) -> None:
     """The fixture raises on purpose: either a real fix in the fixture, or UNFIXABLE."""
     result = _run(tmp_path, sample_remote, FIXTURE_ERROR)
@@ -108,3 +103,25 @@ def test_claude_on_fixture_error(tmp_path: Path, sample_remote: SampleRemote) ->
     for line in removed_lines(result.diff):
         assert not re.match(r"\s*def test_", line), f"test removed: {line}"
         assert not re.match(r"\s*assert ", line), f"assertion removed: {line}"
+
+
+def test_claude_on_fixture_error_with_reviewer(tmp_path: Path, sample_remote: SampleRemote) -> None:
+    """With the reviewer on, no dummy-fixture workaround may be accepted."""
+    from ci_fix.guards.reviewer import ClaudeReviewer
+
+    key = os.environ["ANTHROPIC_API_KEY"]
+    settings = Settings(
+        workspace_dir=tmp_path / "ws", anthropic_api_key=key, max_attempts=MAX_ATTEMPTS
+    )
+    deps = make_deps(
+        tmp_path,
+        ClaudeFixer(settings),
+        remote=sample_remote,
+        reviewer=ClaudeReviewer(settings),
+        max_attempts=MAX_ATTEMPTS,
+        review_test_changes=True,
+    )
+    result = fix_failing_tests(REPO_URL, SAMPLE_PR, [FIXTURE_ERROR], deps=deps)
+    outcome = result.tests[0]
+    print(f"\n=== {FIXTURE_ERROR}: {outcome.status.value}\n{outcome.reason}\n{result.diff}")
+    assert outcome.status == OutcomeStatus.UNFIXABLE, result.diff

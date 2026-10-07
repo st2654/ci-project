@@ -435,3 +435,15 @@ def test_exclude_untracked_keeps_artifacts_through_checkpoint_and_rollback(
     assert (root / ".coverage").is_file()
     exclude = (root / ".git" / "info" / "exclude").read_text()
     assert exclude.splitlines()[-1] == "/.coverage"
+
+
+def test_file_bytes_at_and_file_at(cloned: GitRepo) -> None:
+    assert cloned.file_at("HEAD", "does/not/exist.py") is None
+    assert cloned.file_bytes_at("HEAD", "does/not/exist.py") is None
+    (cloned.path / "app.py").write_text("changed\n")
+    assert cloned.file_at("HEAD", "app.py") != "changed\n"  # HEAD content, not the worktree
+    assert cloned.file_bytes_at("HEAD", "app.py") == cloned.file_at("HEAD", "app.py").encode()
+
+
+def test_files_containing(cloned: GitRepo) -> None:
+    assert cloned.files_containing("no-such-text-anywhere-xyz") == []

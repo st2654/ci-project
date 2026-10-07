@@ -33,6 +33,10 @@ class TestOutcome(BaseModel):
     reason: str = ""
     attempts: int = 0
     files_changed: list[str] = Field(default_factory=list)
+    # Set for FIXED tests (used by the PR description):
+    explanation: str = ""  # the accepted attempt's explanation
+    test_changes: list[str] = Field(default_factory=list)  # "path::test: before → after"
+    source_changed: bool = False  # the accepted fix changed non-test files
 
 
 class FixAttempt(BaseModel):

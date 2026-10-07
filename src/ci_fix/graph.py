@@ -20,6 +20,8 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from ci_fix.config import Settings
+from ci_fix.guards.patch_checker import CheckContext, PatchReport, check_patch
+from ci_fix.guards.reviewer import TestChangeReviewer
 from ci_fix.logging_setup import get_logger
 from ci_fix.models import (
     FixAttempt,
@@ -48,6 +50,12 @@ DELETED_REASON = "test no longer collected after fix — fixes must not delete o
 SKIPPED_AFTER_FIX_REASON = "test skipped after fix — fixes must not skip tests"
 NO_CHANGES_REASON = "no changes made"
 ONLY_TARGET_REASON = "only the target test can be run"
+INTEGRITY_PREFIX = "integrity check failed:"
+REVIEWER_PREFIX = "reviewer rejected test change:"
+REVIEWER_UNAVAILABLE_PREFIX = "reviewer unavailable:"
+# A reviewer call that errors (not fatally) is retried; after this many tries the attempt is
+# rejected like any other (it counts as an attempt): rejecting when in doubt is the safe side.
+REVIEW_TRIES = 2
 _FAILING = (TestStatus.FAILED, TestStatus.ERROR)
 
 
@@ -81,6 +89,8 @@ class PipelineDeps:
     env_factory: Callable[[Path, Path, Settings], TestEnv] = create_test_env
     runner_factory: Callable[[Path, Path, Path, Settings], TestRunner] = _default_runner_factory
     clone_url: str | None = None
+    # Optional second opinion on test-file changes (see ``Settings.review_test_changes``).
+    reviewer: TestChangeReviewer | None = None
 
 
 @dataclass
@@ -119,6 +129,8 @@ class PipelineState(BaseModel):
     history: dict[str, list[FixAttempt]] = Field(default_factory=dict)
     # Results of all resolved ids at the current HEAD (the last accepted state).
     results: dict[str, TestResult] = Field(default_factory=dict)
+    # Patch-checker report of the attempt awaiting verification.
+    patch_report: PatchReport | None = None
     diff: str = ""
     summary: str = ""
 
@@ -163,7 +175,12 @@ def _set_outcome(
     reason: str = "",
     attempts: int = 0,
     files_changed: list[str] | None = None,
+    **details: Any,
 ) -> None:
+    """Set the outcome of every requested name for ``node_id``.
+
+    ``details`` are extra TestOutcome fields (``explanation``, ``test_changes``, …).
+    """
     for name in _names_for(state, node_id):
         outcomes[name] = TestOutcome(
             requested_name=name,
@@ -172,6 +189,7 @@ def _set_outcome(
             reason=reason,
             attempts=attempts,
             files_changed=list(files_changed or []),
+            **details,
         )
     if status == OutcomeStatus.UNFIXABLE:
         log.warning("[unfixable] %s: %s", node_id, reason)
@@ -405,15 +423,13 @@ def build_graph(deps: PipelineDeps) -> Any:
 
         return run_test
 
-    def fix_one(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
-        assert state.prepared is not None and state.current is not None
-        nid = state.current
-        repo = _ctx(config).repo
-        n = state.attempts.get(nid, 0) + 1
+    def make_request(
+        state: PipelineState, nid: str, n: int, previous: list[FixAttempt], config: RunnableConfig
+    ) -> FixRequest:
+        """The fixer's (and reviewer's) view of attempt ``n`` for ``nid`` at the current HEAD."""
+        assert state.prepared is not None
         failure = state.results.get(nid)
-        previous = state.history.get(nid, [])
-        log.info("[fix] %s (attempt %d/%d)", nid, n, settings.max_attempts)
-        request = FixRequest(
+        return FixRequest(
             node_id=nid,
             repo_path=state.prepared.path,
             attempt=n,
@@ -427,6 +443,27 @@ def build_graph(deps: PipelineDeps) -> Any:
             other_failing_tests=[p for p in state.pending if p != nid],
             run_test=make_run_test(nid, config),
         )
+
+    def run_check(repo: GitRepo, nid: str, explanation: str) -> tuple[PatchReport | None, str]:
+        """Run the patch checker; a checker crash gives ``(None, "<Type>: <msg>")``."""
+        test_path = nid.split("::", 1)[0]
+        source = repo.file_at("HEAD", test_path)
+        context = CheckContext(test_files={test_path: source} if source is not None else {})
+        try:
+            return check_patch(repo, explanation, context), ""
+        except Exception as exc:  # a checker bug must neither crash the run nor pass a patch
+            log.error("[integrity] checker error for %s: %s: %s", nid, type(exc).__name__, exc)
+            log.debug("[integrity] checker traceback", exc_info=True)
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def fix_one(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
+        assert state.prepared is not None and state.current is not None
+        nid = state.current
+        repo = _ctx(config).repo
+        n = state.attempts.get(nid, 0) + 1
+        previous = state.history.get(nid, [])
+        log.info("[fix] %s (attempt %d/%d)", nid, n, settings.max_attempts)
+        request = make_request(state, nid, n, previous, config)
         started = time.monotonic()
         update: dict[str, Any] = {"attempts": {**state.attempts, nid: n}}
         try:
@@ -463,8 +500,18 @@ def build_graph(deps: PipelineDeps) -> Any:
             return {**update, "outcomes": outcomes, "pending": pending, "history": history}
         if not files:
             return reject(state, previous, attempt, NO_CHANGES_REASON, update)
+        report, failure = run_check(repo, nid, attempt.explanation)
+        if report is None:
+            repo.rollback()
+            reason = f"{INTEGRITY_PREFIX} checker error: {failure}"
+            return reject(state, previous, attempt, reason, {**update, "patch_report": None})
+        if not report.ok:
+            log.warning("[integrity] %s: %s", nid, ", ".join(report.rule_ids))
+            repo.rollback()
+            reason = f"{INTEGRITY_PREFIX}\n{report.summary()}"
+            return reject(state, previous, attempt, reason, {**update, "patch_report": None})
         history = {**state.history, nid: [*previous, attempt]}
-        return {**update, "history": history}
+        return {**update, "history": history, "patch_report": report}
 
     def verify_one(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
         assert state.current is not None
@@ -494,15 +541,31 @@ def build_graph(deps: PipelineDeps) -> Any:
                         log.info("[verify] %s failed on re-run; treating as flaky", other)
         # Files the test runs created (not the fixer's) are artifacts: keep them out.
         repo.exclude(repo.untracked_files() - untracked_before)
+        report = state.patch_report or PatchReport()
+        if not reasons:
+            rejected = review(state, nid, n, earlier, attempt, report, config)
+            if rejected:
+                reasons = [rejected]
         if reasons:
             repo.rollback()  # HEAD (and so ``state.results``) is the pre-attempt state
-            return reject(state, earlier, attempt, "; ".join(reasons), {})
+            return reject(state, earlier, attempt, "; ".join(reasons), {"patch_report": None})
 
         repo.checkpoint(f"ci-fix: fix {nid} (attempt {n})")
         files = attempt.files_changed
         log.info("[verify] %s fixed after %d attempt(s)", nid, n)
         outcomes = dict(state.outcomes)
-        _set_outcome(outcomes, state, nid, OutcomeStatus.FIXED, "", n, files)
+        _set_outcome(
+            outcomes,
+            state,
+            nid,
+            OutcomeStatus.FIXED,
+            "",
+            n,
+            files,
+            explanation=attempt.explanation,
+            test_changes=[c.describe() for c in report.expectation_changes],
+            source_changed=bool(report.source_files_changed),
+        )
         pending = []
         for other in state.pending:
             if other == nid:
@@ -520,7 +583,51 @@ def build_graph(deps: PipelineDeps) -> Any:
             "pending": pending,
             "results": after,
             "history": {**state.history, nid: [*earlier, accepted]},
+            "patch_report": None,
         }
+
+    def review(
+        state: PipelineState,
+        nid: str,
+        n: int,
+        earlier: list[FixAttempt],
+        attempt: FixAttempt,
+        report: PatchReport,
+        config: RunnableConfig,
+    ) -> str:
+        """Ask the reviewer about test-file changes; return a rejection reason ("" = ok)."""
+        if deps.reviewer is None or not report.test_files_changed:
+            return ""
+        repo = _ctx(config).repo
+        diff = repo.diff("HEAD")  # the attempt only: HEAD is the last checkpoint
+        request = make_request(state, nid, n, earlier, config)
+        log.info(
+            "[review] %s: reviewing test changes in %s", nid, ", ".join(report.test_files_changed)
+        )
+        verdict, error = None, ""
+        for n_try in range(1, REVIEW_TRIES + 1):
+            try:
+                verdict = deps.reviewer.review(request, diff, attempt.explanation)
+                break
+            except FixerFatalError:
+                repo.rollback()
+                raise
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                log.warning(
+                    "[review] reviewer error for %s (try %d/%d): %s",
+                    nid,
+                    n_try,
+                    REVIEW_TRIES,
+                    error,
+                )
+                log.debug("[review] reviewer traceback", exc_info=True)
+        if verdict is None:  # when in doubt, reject
+            return f"{REVIEWER_UNAVAILABLE_PREFIX} {error}"
+        if verdict.approved:
+            return ""
+        log.warning("[review] %s: test change rejected: %s", nid, verdict.reason)
+        return f"{REVIEWER_PREFIX} {verdict.reason}"
 
     def finalize(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
         diff = ""

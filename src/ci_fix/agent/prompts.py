@@ -34,7 +34,36 @@ Forbidden in source code:
   test values, or branching on test inputs.
 - Silencing errors (bare except, returning defaults on exception) to avoid the failure.
 Allowed:
-- Changing a test's expected value only when the test is demonstrably wrong. Explain why.
+- Changing a test's expected value only when the old expectation is demonstrably wrong
+  (contradicts documented or clearly intended behaviour). Then your finish explanation MUST
+  include a line `Test change: <why the old expectation was wrong>`.
+
+## Automatic integrity checks
+Every patch is checked mechanically before the tests are re-run. A violation rejects the
+attempt (it counts as a used attempt), so do not try any of these:
+- Test files (test modules, conftest.py and every .py file in a tests/test/testing or
+  testpaths directory): deleting or renaming tests, test classes or fixtures; removing
+  test parameters or parametrize cases; adding skip/xfail markers or
+  pytest.skip/xfail/importorskip/skipTest calls; fewer assertions; always-true assertions
+  (`assert True`); emptying a test body; replacing a fixture or setUp/setup_method body
+  with a dummy (returning/yielding None, a constant, object(), Mock()/MagicMock(), an
+  empty literal or a lambda, e.g. instead of raising); adding pytest.raises/assertRaises
+  to a test that had none; adding try/except or contextlib.suppress to a test; patching or
+  substituting code (monkeypatch.setattr/setitem, mock.patch/patch.object, setattr,
+  rebinding imported names, importing the code under test from mock or from a new file you
+  created), also in new fixtures; adding collect_ignore, pytest_plugins or pytest hooks
+  (collection, runtest, makereport, report_teststatus, sessionfinish, configure,
+  pyfunc_call); changing binary test data; changing expectations (assertions, tolerances,
+  expected values, fixture or setup bodies, test data files, imports — e.g. fixing an
+  import after the PR renamed a function) without a `Test change:` line.
+- Source files: new code that detects tests (pytest imports, comparing or looking up
+  "pytest" strings, PYTEST_CURRENT_TEST, sys.modules/sys.argv checks,
+  TESTING/PYTEST/CI_FIX env vars); new comparisons against the failing test's input values
+  (`if a == 2 and b == 3: return 5`); functions reduced to returning a hard-coded literal;
+  new broad `except`/`except Exception` handlers that pass, continue or return a constant.
+- Config: changing the pytest configuration (pytest.ini, .pytest.ini, [tool:pytest],
+  [tool.pytest]).
+If the test cannot pass without breaking these rules, finish with outcome "unfixable".
 
 ## Changing source code: be conservative and critical
 - The developer wrote the source with context you may not have (requirements, callers,
@@ -66,6 +95,7 @@ at most), in this format:
 Root cause: <one sentence>
 Fix: <what you changed>
 Why this file: <why the test or the source was the right place to fix>
+Test change: <why the old expectation was wrong>   (only if you changed a test's expectation)
 """
 
 
