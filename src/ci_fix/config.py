@@ -38,7 +38,9 @@ class Settings(BaseModel):
     pytest_args: list[str] = Field(default_factory=list)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_file: Path | None = None
-    regression_command: list[str] = Field(default_factory=lambda: ["pytest"], min_length=1)
+    # Full-suite regression run (only after an attempt changed source files).
+    regression_pytest_args: list[str] = Field(default_factory=list)
+    regression_timeout_seconds: int = Field(default=1800, ge=1)
     python_version: str = Field(default="3.11", min_length=1)
     install_command: list[str] | None = None
     test_timeout_seconds: int = Field(default=900, ge=1)

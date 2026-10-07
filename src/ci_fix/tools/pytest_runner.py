@@ -266,7 +266,7 @@ class PytestRunner:
         self.plugin_dir.mkdir(parents=True, exist_ok=True)
         (self.plugin_dir / f"{PLUGIN_MODULE}.py").write_text(_PLUGIN_SOURCE, encoding="utf-8")
 
-    def _pytest(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def _pytest(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         self._ensure_plugin()
         # --rootdir pins node ids to the repo root even when the repo has no pytest config;
         # otherwise ids would depend on which paths are passed (collect vs run).
@@ -279,9 +279,69 @@ class PytestRunner:
             f"--rootdir={self.repo_path}",
             *args,
         ]
-        return _run(argv, self.repo_path, self.env, self.timeout)
+        return _run(argv, self.repo_path, self.env, self.timeout if timeout is None else timeout)
 
-    def collect(self) -> list[str]:
+    def _junit_args(self, junit: Path) -> list[str]:
+        """Options shared by every reporting run (``run`` and ``run_all``)."""
+        return [
+            "--continue-on-collection-errors",
+            f"--junitxml={junit}",
+            "-o",
+            "junit_family=xunit1",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            "-rN",
+        ]
+
+    def run_all(
+        self, extra_args: Sequence[str] = (), timeout: float | None = None
+    ) -> TestRunResult:
+        """Run the whole test suite (what pytest's own config collects).
+
+        Results are keyed by the real node ids; a file that fails to import is one ERROR
+        entry keyed by its path. ``extra_args`` come after the runner's own ``extra_args``;
+        ``timeout`` overrides the runner's timeout for this run. Raises ``TestRunError`` on a
+        timeout or when pytest produces no usable report.
+        """
+        self._runs += 1
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        junit = self.reports_dir / f"full-{self._runs}.xml"
+        junit.unlink(missing_ok=True)
+        log.info("[regression] Running full test suite")
+        started = time.monotonic()
+        proc = self._pytest(
+            *self._junit_args(junit), *self.extra_args, *extra_args, timeout=timeout
+        )
+        duration = time.monotonic() - started
+        output_tail = (proc.stdout or "")[-OUTPUT_TAIL_CHARS:]
+        cases: list[TestResult] | None = None
+        if junit.is_file() and junit.stat().st_size > 0:
+            try:
+                cases = _parse_junit(junit)
+            except ET.ParseError as exc:
+                log.debug("Could not parse %s: %s", junit, exc)
+        # Exit 5 = nothing collected (an empty suite is a valid result).
+        if cases is None or (not cases and proc.returncode not in (0, 5)):
+            raise TestRunError(
+                f"pytest did not produce results for the full suite (exit {proc.returncode})"
+                f"\n{output_tail}".rstrip()
+            )
+        results = {c.node_id: c for c in cases}
+        counts = {st: sum(1 for r in results.values() if r.status is st) for st in TestStatus}
+        log.info(
+            "[regression] %d passed, %d failed, %d error, %d skipped in %.1fs",
+            counts[TestStatus.PASSED],
+            counts[TestStatus.FAILED],
+            counts[TestStatus.ERROR],
+            counts[TestStatus.SKIPPED],
+            duration,
+        )
+        return TestRunResult(
+            results=results, exit_code=proc.returncode, duration=duration, output_tail=output_tail
+        )
+
+    def collect(self, timeout: float | None = None) -> list[str]:
         """Return all node ids pytest collects in the repo.
 
         Test files that fail to import are recorded in ``collection_errors`` (their tests
@@ -294,6 +354,7 @@ class PytestRunner:
             "no:cacheprovider",
             "--continue-on-collection-errors",
             *self.extra_args,
+            timeout=timeout,
         )
         stdout = proc.stdout or ""
         if proc.returncode not in (0, 1, 5):
@@ -312,7 +373,7 @@ class PytestRunner:
             if "::" in line and not line.startswith("ERROR")
         ]
 
-    def _unknown_ids(self, requested: Sequence[str]) -> set[str]:
+    def _unknown_ids(self, requested: Sequence[str], timeout: float | None = None) -> set[str]:
         """Requested ids pytest does not collect.
 
         pytest refuses to run *any* test when one requested id doesn't exist, so unknown ids
@@ -320,7 +381,7 @@ class PytestRunner:
         file, which may be the very bug to fix), nothing is filtered and pytest reports it.
         """
         try:
-            collected = set(self.collect())
+            collected = set(self.collect(timeout))
         except TestRunError as exc:
             log.debug("Collection failed; running requested ids unfiltered: %s", exc)
             self._collected = set()
@@ -343,10 +404,16 @@ class PytestRunner:
             return True
         return "[" not in nid and any(c.startswith(nid + "[") for c in self._collected)
 
-    def run(self, node_ids: Sequence[str]) -> TestRunResult:
-        """Run ``node_ids`` and return results keyed by the requested ids."""
+    def run(
+        self, node_ids: Sequence[str], extra_args: Sequence[str] = (), timeout: float | None = None
+    ) -> TestRunResult:
+        """Run ``node_ids`` and return results keyed by the requested ids.
+
+        ``extra_args`` are added after the runner's own (for this run only, not collection);
+        ``timeout`` overrides the runner's timeout for both collection and the run.
+        """
         requested = list(dict.fromkeys(node_ids))
-        unknown = self._unknown_ids(requested)
+        unknown = self._unknown_ids(requested, timeout)
         runnable = [nid for nid in requested if nid not in unknown]
         if not runnable:
             log.info("[tests] None of the %d requested test(s) were collected", len(requested))
@@ -365,16 +432,7 @@ class PytestRunner:
         log.info("[tests] Running %d test(s)", len(runnable))
         started = time.monotonic()
         proc = self._pytest(
-            *targets,
-            "--continue-on-collection-errors",
-            f"--junitxml={junit}",
-            "-o",
-            "junit_family=xunit1",
-            "-p",
-            "no:cacheprovider",
-            "-q",
-            "-rN",
-            *self.extra_args,
+            *targets, *self._junit_args(junit), *self.extra_args, *extra_args, timeout=timeout
         )
         duration = time.monotonic() - started
         output_tail = (proc.stdout or "")[-OUTPUT_TAIL_CHARS:]

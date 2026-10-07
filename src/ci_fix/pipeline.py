@@ -90,6 +90,8 @@ def fix_failing_tests(
         diff=final.diff,
         summary=final.summary,
         tests=tests,
+        preexisting_failures=final.preexisting_failures,
+        warnings=final.warnings,
     )
     counts = {s: sum(1 for t in tests if t.status == s) for s in OutcomeStatus}
     log.info(

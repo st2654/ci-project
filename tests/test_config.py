@@ -54,7 +54,8 @@ def test_settings_defaults() -> None:
     assert s.max_parallel_workers == 4
     assert s.branch_prefix == "ci-fix/pr-"
     assert s.pytest_args == []
-    assert s.regression_command == ["pytest"]
+    assert s.regression_pytest_args == []
+    assert s.regression_timeout_seconds == 1800
     assert s.anthropic_api_key is None
     assert s.github_token is None
 
@@ -161,7 +162,8 @@ max_parallel_workers = 2
 workspace_dir = "~/somewhere/else"
 branch_prefix = "fix/"
 pytest_args = ["-x", "-q"]
-regression_command = ["uv", "run", "pytest"]
+regression_pytest_args = ["-m", "not slow"]
+regression_timeout_seconds = 60
 """,
         name="custom.toml",
     )
@@ -173,7 +175,8 @@ regression_command = ["uv", "run", "pytest"]
     assert s.workspace_dir == Path("~/somewhere/else").expanduser()
     assert s.branch_prefix == "fix/"
     assert s.pytest_args == ["-x", "-q"]
-    assert s.regression_command == ["uv", "run", "pytest"]
+    assert s.regression_pytest_args == ["-m", "not slow"]
+    assert s.regression_timeout_seconds == 60
 
 
 def test_load_partial_toml_keeps_other_defaults(tmp_path: Path) -> None:
@@ -213,7 +216,8 @@ def test_load_invalid_toml_raises(tmp_path: Path) -> None:
         "temperature = -0.1",
         "max_attempts = 0",
         "max_parallel_workers = 0",
-        "regression_command = []",
+        "regression_timeout_seconds = 0",
+        'regression_command = ["pytest"]',
         'max_attempts = "three"',
         "unknown_key = 1",
     ],

@@ -216,6 +216,8 @@ class FakeRunner:
     artifacts: bool = False  # each run leaves .coverage and out/run-<n>.log behind
     collection_errors: set[str] = field(default_factory=set)
     runs: list[list[str]] = field(default_factory=list)
+    full_runs: int = 0  # run_all calls (not recorded in ``runs``)
+    run_options: list[tuple[list[str], float | None]] = field(default_factory=list)  # per run
 
     def _read(self, relpath: str) -> str:
         path = self.repo_path / relpath
@@ -232,14 +234,27 @@ class FakeRunner:
         message = "" if verdict == TestStatus.PASSED else f"{verdict.value}: {node_id}"
         return TestResult(node_id=node_id, status=verdict, message=message, details=message)
 
-    def run(self, node_ids: Sequence[str]) -> TestRunResult:
+    def run(
+        self, node_ids: Sequence[str], extra_args: Sequence[str] = (), timeout: float | None = None
+    ) -> TestRunResult:
         ids = list(dict.fromkeys(node_ids))
         self.runs.append(ids)
+        self.run_options.append((list(extra_args), timeout))
         if self.artifacts:
             (self.repo_path / ".coverage").write_text(f"run {len(self.runs)}\n")
             (self.repo_path / "out").mkdir(exist_ok=True)
             (self.repo_path / "out" / f"run-{len(self.runs)}.log").write_text("log\n")
         results = {nid: self._result(nid) for nid in ids}
+        failed = any(r.status != TestStatus.PASSED for r in results.values())
+        return TestRunResult(results=results, exit_code=int(failed), duration=0.0, output_tail="")
+
+    def run_all(
+        self, extra_args: Sequence[str] = (), timeout: float | None = None
+    ) -> TestRunResult:
+        """The whole "suite": every rule's test that is currently collected."""
+        self.full_runs += 1
+        results = {nid: self._result(nid) for nid in self.rules}
+        results = {k: v for k, v in results.items() if v.status != TestStatus.NOT_FOUND}
         failed = any(r.status != TestStatus.PASSED for r in results.values())
         return TestRunResult(results=results, exit_code=int(failed), duration=0.0, output_tail="")
 

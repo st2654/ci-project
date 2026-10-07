@@ -259,6 +259,9 @@ class PatchReport(BaseModel):
     expectation_changes: list[ExpectationChange] = Field(default_factory=list)
     test_files_changed: list[str] = Field(default_factory=list)
     source_files_changed: list[str] = Field(default_factory=list)
+    # Test files other tests may depend on: conftest.py, test-dir modules without tests
+    # (helpers, factories) and test data. Changing them triggers the regression run.
+    shared_test_files_changed: list[str] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -316,6 +319,8 @@ def check_patch(
             before, after = repo.file_at("HEAD", path), _read_worktree(repo, path, report)
             if layout.is_test_path(path):
                 report.test_files_changed.append(path)
+                if _is_shared_test_module(path, before, after):
+                    report.shared_test_files_changed.append(path)
                 violations, changes = check_test_file(path, before, after, new_modules)
                 report.violations += violations
                 report.expectation_changes += changes
@@ -328,6 +333,7 @@ def check_patch(
                 )
         elif layout.in_test_dir(path):
             report.test_files_changed.append(path)
+            report.shared_test_files_changed.append(path)
             violation, change = check_test_data(
                 path, repo.file_bytes_at("HEAD", path), _read_bytes(repo, path)
             )
@@ -339,6 +345,14 @@ def check_patch(
                 Violation(rule="unjustified_test_change", path=path, message=UNJUSTIFIED_MESSAGE)
             )
     return report
+
+
+def _is_shared_test_module(path: str, before: str | None, after: str | None) -> bool:
+    """conftest.py, or a module in the test tree that defines no tests (helpers, factories)."""
+    if PurePosixPath(path).name == "conftest.py":
+        return True
+    versions = [_TestModule.build(src, _parse_quiet(src, path)) for src in (before, after) if src]
+    return all(not (mod.tests or mod.classes) for mod in versions)
 
 
 def _read_bytes(repo: GitRepo, path: str) -> bytes | None:

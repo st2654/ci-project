@@ -4,7 +4,8 @@ setup → resolve → run_initial → select_next ⇄ fix_one → verify_one →
 
 Failing tests are fixed one at a time. Every attempt is verified against ALL requested
 tests: an accepted attempt becomes a local checkpoint commit, a rejected one is rolled back
-and its reason is passed to the next attempt.
+and its reason is passed to the next attempt. An attempt that changed source (non-test) files
+must also not break any test of the full suite that passed before (regression check).
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from ci_fix.tools.github import GitHubClient
 from ci_fix.tools.pytest_runner import (
     PytestRunner,
     TestResult,
+    TestRunError,
     TestRunResult,
     TestStatus,
     resolve_test_names,
@@ -56,6 +58,10 @@ REVIEWER_UNAVAILABLE_PREFIX = "reviewer unavailable:"
 # A reviewer call that errors (not fatally) is retried; after this many tries the attempt is
 # rejected like any other (it counts as an attempt): rejecting when in doubt is the safe side.
 REVIEW_TRIES = 2
+REGRESSION_PREFIX = "broke other tests in the full suite:"
+REGRESSION_SKIPPED_PREFIX = "regression check skipped:"
+RESTORE_FAILED_PREFIX = "could not restore the attempt after the baseline run:"
+REGRESSION_LIST_MAX = 10  # regressed ids named in a rejection reason
 _FAILING = (TestStatus.FAILED, TestStatus.ERROR)
 
 
@@ -68,7 +74,13 @@ class TestRunner(Protocol):
 
     def collect(self) -> list[str]: ...
 
-    def run(self, node_ids: Sequence[str]) -> TestRunResult: ...
+    def run(
+        self, node_ids: Sequence[str], extra_args: Sequence[str] = (), timeout: float | None = None
+    ) -> TestRunResult: ...
+
+    def run_all(
+        self, extra_args: Sequence[str] = (), timeout: float | None = None
+    ) -> TestRunResult: ...
 
 
 def _default_runner_factory(
@@ -131,6 +143,13 @@ class PipelineState(BaseModel):
     results: dict[str, TestResult] = Field(default_factory=dict)
     # Patch-checker report of the attempt awaiting verification.
     patch_report: PatchReport | None = None
+    # Full-suite statuses at HEAD, set at the first attempt that changes source files and
+    # replaced after each accepted source change. None = not computed yet.
+    regression_baseline: dict[str, TestStatus] | None = None
+    # The baseline full-suite run failed (e.g. timeout): no regression checks this run.
+    regression_unavailable: bool = False
+    preexisting_failures: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     diff: str = ""
     summary: str = ""
 
@@ -248,6 +267,52 @@ def judge(target: str, before: dict[str, TestResult], after: dict[str, TestResul
         elif new.status == TestStatus.SKIPPED and old.status != TestStatus.SKIPPED:
             verdict.skipped.append(nid)
     return verdict
+
+
+def _covers(requested_id: str, node_id: str) -> bool:
+    """Whether ``node_id`` is ``requested_id`` itself or one of its parametrized cases."""
+    return node_id == requested_id or node_id.startswith(requested_id + "[")
+
+
+def find_regressions(
+    baseline: dict[str, TestStatus], current: dict[str, TestStatus], requested: Sequence[str]
+) -> list[str]:
+    """Ids that passed in ``baseline`` and now fail, error or are missing (sorted).
+
+    Requested tests are left out: their verdict comes from :func:`judge`.
+    """
+    regressed = []
+    for nid, status in baseline.items():
+        if status != TestStatus.PASSED or any(_covers(r, nid) for r in requested):
+            continue
+        now = current.get(nid)
+        if now is None or now in _FAILING or now == TestStatus.NOT_FOUND:
+            regressed.append(nid)
+    return sorted(regressed)
+
+
+def _id_list(ids: Sequence[str]) -> str:
+    """Up to ``REGRESSION_LIST_MAX`` ids, then "and N more"."""
+    shown = ", ".join(ids[:REGRESSION_LIST_MAX])
+    extra = len(ids) - REGRESSION_LIST_MAX
+    return shown + (f" and {extra} more" if extra > 0 else "")
+
+
+def regression_reason(failing: Sequence[str], missing: Sequence[str] = ()) -> str:
+    """Rejection reason: ids now failing, then ids no longer collected (each list capped)."""
+    parts = [_id_list(failing)] if failing else []
+    if missing:
+        parts.append(f"no longer collected: {_id_list(missing)}")
+    return f"{REGRESSION_PREFIX} {'; '.join(parts)}"
+
+
+def preexisting_failures(baseline: dict[str, TestStatus], requested: Sequence[str]) -> list[str]:
+    """Ids failing in ``baseline`` that are not requested tests (sorted)."""
+    return sorted(
+        nid
+        for nid, status in baseline.items()
+        if status in _FAILING and not any(_covers(r, nid) for r in requested)
+    )
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -546,9 +611,18 @@ def build_graph(deps: PipelineDeps) -> Any:
             rejected = review(state, nid, n, earlier, attempt, report, config)
             if rejected:
                 reasons = [rejected]
+        regression: dict[str, Any] = {}
+        needs_full_suite = bool(
+            report.source_files_changed or report.shared_test_files_changed
+        )  # source, or shared test code (conftest/helpers/data) other tests may use
+        if not reasons and needs_full_suite and not state.regression_unavailable:
+            rejected, regression = regression_check(state, config)
+            if rejected:
+                reasons = [rejected]
         if reasons:
             repo.rollback()  # HEAD (and so ``state.results``) is the pre-attempt state
-            return reject(state, earlier, attempt, "; ".join(reasons), {"patch_report": None})
+            update = {"patch_report": None, **regression}
+            return reject(state, earlier, attempt, "; ".join(reasons), update)
 
         repo.checkpoint(f"ci-fix: fix {nid} (attempt {n})")
         files = attempt.files_changed
@@ -584,7 +658,152 @@ def build_graph(deps: PipelineDeps) -> Any:
             "results": after,
             "history": {**state.history, nid: [*earlier, accepted]},
             "patch_report": None,
+            **regression,
         }
+
+    def full_suite(
+        config: RunnableConfig, keep: frozenset[str] | set[str] = frozenset()
+    ) -> dict[str, TestStatus]:
+        """Run the whole suite; files the run creates are excluded as artifacts.
+
+        Paths in ``keep`` are never excluded (the stashed attempt's own new files).
+        """
+        repo = _ctx(config).repo
+        untracked_before = repo.untracked_files()
+        try:
+            run = _runner(config).run_all(
+                settings.regression_pytest_args, settings.regression_timeout_seconds
+            )
+        finally:
+            repo.exclude(repo.untracked_files() - untracked_before - keep)
+        return {tid: res.status for tid, res in run.results.items()}
+
+    def restore_attempt(repo: GitRepo, attempt_untracked: set[str], changed: list[str]) -> str:
+        """Pop the stashed attempt after the baseline run; return an error ("" = restored).
+
+        Whatever the run changed is undone first: tracked files are reset to HEAD and files
+        it created at the attempt's own new paths are deleted (they would block the pop).
+        On failure the working tree is reset to HEAD (checkpoints are untouched) and the
+        stash is dropped, so the attempt is lost and must be rejected.
+        """
+        try:
+            repo.reset_hard()
+            for rel in attempt_untracked:
+                path = repo.path / rel
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+            repo.unstash()
+            now = repo.changed_files()
+            if now != changed:
+                return f"changed files {now} do not match the attempt's {changed}"
+            return ""
+        except (GitError, OSError) as exc:
+            return f"{type(exc).__name__}: {exc}"
+
+    def discard_attempt(repo: GitRepo) -> None:
+        """Reset to HEAD and drop a leftover stash, after the attempt could not be restored."""
+        try:
+            repo.rollback()
+            if repo.has_stash():
+                repo.drop_stash()
+        except GitError as exc:  # rejecting anyway; verify_one rolls back again
+            log.error("[regression] Could not clean up after a failed restore: %s", exc)
+
+    def regression_baseline(
+        config: RunnableConfig,
+    ) -> tuple[dict[str, TestStatus] | None, str, str]:
+        """Full-suite statuses at HEAD, without the attempt's changes (stashed meanwhile).
+
+        Returns ``(baseline or None, run error, restore error)``.
+        """
+        repo = _ctx(config).repo
+        log.info("[regression] Source files changed: running the full suite without the fix")
+        changed = repo.changed_files()
+        # The attempt's new files (intent-to-add entries by now, so not "untracked").
+        attempt_untracked = repo.added_files()
+        stashed = repo.stash_all()
+        baseline, run_error, restore_error = None, "", ""
+        try:
+            baseline = full_suite(config, keep=attempt_untracked)
+        except TestRunError as exc:
+            run_error = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            log.debug("[regression] baseline error: %s", exc)
+        finally:
+            if stashed:
+                restore_error = restore_attempt(repo, attempt_untracked, changed)
+                if restore_error:
+                    log.error("[regression] Could not restore the attempt: %s", restore_error)
+                    discard_attempt(repo)
+        if baseline is not None:
+            failing = sum(1 for st in baseline.values() if st in _FAILING)
+            passed = sum(1 for st in baseline.values() if st == TestStatus.PASSED)
+            log.info(
+                "[regression] Baseline: %d passed, %d failing before any source change",
+                passed,
+                failing,
+            )
+        return baseline, run_error, restore_error
+
+    def skip_regression(state: PipelineState, message: str) -> dict[str, Any]:
+        """State update that turns regression checks off for the rest of the run."""
+        log.warning("[regression] Regression check skipped for the rest of the run: %s", message)
+        warning = f"{REGRESSION_SKIPPED_PREFIX} {message}"
+        return {"regression_unavailable": True, "warnings": [*state.warnings, warning]}
+
+    def regression_check(
+        state: PipelineState, config: RunnableConfig
+    ) -> tuple[str, dict[str, Any]]:
+        """Full-suite check of an attempt that changed source files.
+
+        Returns ``(rejection reason or "", state update)``. The update carries the baseline
+        (computed here the first time), or turns the check off when a full run fails.
+        """
+        update: dict[str, Any] = {}
+        baseline = state.regression_baseline
+        if baseline is None:
+            baseline, run_error, restore_error = regression_baseline(config)
+            if baseline is not None:
+                update["regression_baseline"] = baseline
+            else:
+                update = skip_regression(state, run_error)
+            if restore_error:
+                return f"{RESTORE_FAILED_PREFIX} {restore_error}", update
+            if baseline is None:
+                return "", update
+        requested = _unique_ids(state)
+        try:
+            current = full_suite(config)
+            regressed = find_regressions(baseline, current, requested)
+            if regressed:
+                # Re-run once so a flaky test doesn't sink a good fix.
+                rerun = _runner(config).run(
+                    regressed,
+                    extra_args=settings.regression_pytest_args,
+                    timeout=settings.regression_timeout_seconds,
+                )
+                still = []
+                for tid in regressed:
+                    res = rerun.results.get(tid)
+                    status = res.status if res is not None else TestStatus.NOT_FOUND
+                    if status in _FAILING or status == TestStatus.NOT_FOUND:
+                        still.append(tid)
+                        if status == TestStatus.NOT_FOUND:
+                            current.pop(tid, None)
+                    else:
+                        log.info("[regression] %s passed on re-run; treating as flaky", tid)
+                        current[tid] = status
+                regressed = still
+        except TestRunError as exc:
+            message = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            log.debug("[regression] full-suite error: %s", exc)
+            return "", {**update, **skip_regression(state, message)}
+        if regressed:
+            failing = [t for t in regressed if t in current]
+            missing = [t for t in regressed if t not in current]
+            log.warning("[regression] %d test(s) broke: %s", len(regressed), ", ".join(regressed))
+            return regression_reason(failing, missing), update
+        log.info("[regression] No regressions in the full suite")
+        return "", {**update, "regression_baseline": current}
 
     def review(
         state: PipelineState,
@@ -635,6 +854,14 @@ def build_graph(deps: PipelineDeps) -> Any:
             # The worktree is clean: the diff is exactly the accepted checkpoint commits.
             diff = _ctx(config).repo.diff(state.prepared.pr_head_sha)
         summary = build_summary(state)
+        preexisting: list[str] = []
+        if state.regression_baseline is not None:
+            preexisting = preexisting_failures(state.regression_baseline, _unique_ids(state))
+            if preexisting:
+                log.info(
+                    "[finalize] %d pre-existing failure(s) outside the requested tests",
+                    len(preexisting),
+                )
         counts: dict[str, int] = {}
         for outcome in state.outcomes.values():
             counts[outcome.status.value] = counts.get(outcome.status.value, 0) + 1
@@ -643,7 +870,7 @@ def build_graph(deps: PipelineDeps) -> Any:
             ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no outcomes",
             len(diff.splitlines()),
         )
-        return {"diff": diff, "summary": summary}
+        return {"diff": diff, "summary": summary, "preexisting_failures": preexisting}
 
     def after_resolve(state: PipelineState) -> str:
         return "run_initial" if state.name_to_id else "finalize"

@@ -22,8 +22,13 @@ workspace_dir = "~/.ci-fix/workspaces"
 branch_prefix = "ci-fix/pr-"
 # Extra arguments passed to pytest when running the target tests.
 pytest_args = []
-# Command for the full regression suite, run only when source files changed.
-regression_command = ["pytest"]
+# Full test suite run, only when a fix changed source (non-test) files: once before the
+# first source change (baseline) and once per such attempt. A test that passed in the
+# baseline and fails afterwards rejects the attempt.
+# Extra pytest arguments for the full-suite runs (pytest's own config decides what runs).
+# regression_pytest_args = ["-m", "not slow"]
+# Timeout in seconds for one full-suite run.
+# regression_timeout_seconds = 1800
 # Python version for the test environment when the target repo has no .python-version file.
 python_version = "3.11"
 # Optional custom dependency install command, run in the repo with the test venv active.

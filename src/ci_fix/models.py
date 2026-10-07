@@ -109,6 +109,11 @@ class FixResult(BaseModel):
     summary: str
     tests: list[TestOutcome]  # in the order the user passed the names
     pr_url: str | None = None
+    # Tests outside the requested ones that already failed before any source change
+    # (from the full-suite regression baseline; [] when no source file was changed).
+    preexisting_failures: list[str] = Field(default_factory=list)
+    # Things the user should know about the run (e.g. a skipped regression check).
+    warnings: list[str] = Field(default_factory=list)
 
     @property
     def fixed(self) -> list[TestOutcome]:

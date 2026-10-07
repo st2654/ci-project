@@ -200,6 +200,12 @@ class GitRepo:
         out = self._git("diff", "--name-only", "--no-renames", "HEAD")
         return sorted(set(out.splitlines()))
 
+    def added_files(self) -> set[str]:
+        """Paths in the working tree that are not in HEAD (new, non-ignored files)."""
+        self._git("add", "--all", "--intent-to-add")
+        out = self._git("diff", "--name-only", "--no-renames", "--diff-filter=A", "-z", "HEAD")
+        return {p for p in out.split("\0") if p}
+
     def file_bytes_at(self, rev: str, path: str) -> bytes | None:
         """Raw content of repo-relative ``path`` at commit ``rev`` (None if it is not there)."""
         argv = ["git", *_SAFE_CONFIG, "show", f"{rev}:{path}"]
@@ -242,9 +248,46 @@ class GitRepo:
 
     def rollback(self) -> None:
         """Discard all uncommitted changes and untracked files (gitignored files are kept)."""
-        self._git("reset", "--hard", "-q", "HEAD")
+        self.reset_hard()
         self._git("clean", "-fdq")
         log.debug("Rolled back working tree to %s", self.head_sha()[:12])
+
+    def stash_all(self) -> bool:
+        """Stash tracked changes and untracked (not ignored) files; False if there were none.
+
+        ``--intent-to-add`` entries (left by ``diff`` and ``changed_files``) make
+        ``git stash`` fail, so they are dropped from the index first (the files stay and are
+        stashed as untracked). Other staged changes are kept and restored by ``unstash``.
+        """
+        if self.is_clean():
+            log.debug("Stash skipped: nothing to stash")
+            return False
+        # Index-vs-worktree "added" entries are exactly the intent-to-add ones.
+        out = self._git("diff", "--name-only", "--diff-filter=A", "-z")
+        intent_to_add = [p for p in out.split("\0") if p]
+        if intent_to_add:
+            self._git("rm", "--cached", "-q", "--", *intent_to_add)
+        self._git(*_COMMIT_CONFIG, "stash", "push", "--include-untracked", "-q", "-m", "ci-fix")
+        log.debug("Stashed working tree changes")
+        return True
+
+    def unstash(self) -> None:
+        """Restore the latest stash (``git stash pop --index``); GitError on a conflict."""
+        self._git(*_COMMIT_CONFIG, "stash", "pop", "--index", "-q")
+        log.debug("Restored stashed working tree changes")
+
+    def has_stash(self) -> bool:
+        """Whether the stash list is non-empty."""
+        return self._git("stash", "list") != ""
+
+    def drop_stash(self) -> None:
+        """Drop the latest stash entry (GitError if there is none)."""
+        self._git("stash", "drop", "-q")
+        log.debug("Dropped the latest stash entry")
+
+    def reset_hard(self) -> None:
+        """Reset tracked files and the index to HEAD; untracked files are left alone."""
+        self._git("reset", "--hard", "-q", "HEAD")
 
     def untracked_files(self) -> set[str]:
         """Untracked, non-ignored files (one entry per file, also inside untracked dirs)."""

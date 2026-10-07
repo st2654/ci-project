@@ -39,7 +39,7 @@ opens a PR with a concise, human-readable description.
 | Target-repo isolation | PR code runs with an **allowlisted environment**: its own venv, no `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`/`PYTHON*`/`CI_FIX_*`. Timeouts kill the whole process group. PR tests can write to `.git`, so every git call runs with hooks and fsmonitor disabled (`-c core.hooksPath=/dev/null -c core.fsmonitor=false`) and without those secret env vars. |
 | Test names | Full pytest node ids are used as given; bare names (`test_a`, `Cls::test_a`) are resolved via `pytest --collect-only`. Ambiguous or unknown names are reported, never guessed. |
 | Fix attempts | **3** fix → re-test rounds per test, then report it as unfixable |
-| Regression runs | Run the **full test suite** **only if the fix changed source code** (non-test files). Test-only fixes re-run just the target tests. |
+| Regression runs | Run the **full test suite** **only if the fix changed source code** (non-test files, per the patch checker) **or shared test code** (`conftest.py`, test-dir modules without tests such as helpers/factories, test data files). Baseline (fix stashed) at the first source change, then one full run per source-changing attempt; a test that passed in the baseline and now fails (after one flaky re-run) rejects the attempt. Test-only fixes re-run just the requested tests. Config: `regression_pytest_args`, `regression_timeout_seconds` (default 1800). |
 | Secrets/config | Loaded from `config` + environment; the user fills in values (see "Configuration") |
 
 ---
@@ -107,8 +107,37 @@ setup_repo ─► setup_env ─► resolve_tests ─► run_initial ─► selec
    - **Rejected** attempts are **rolled back** (`reset --hard` + `clean -fd`), and
      the rejection reason is passed to the next attempt. After `max_attempts`
      (default 3) the test is UNFIXABLE with the last reason.
-5. **regression** (slice 6) — Only if any non-test file changed: run the
-   regression suite. A new failure counts as a failed fix attempt.
+5. **regression** (slice 6, inside verify_one) — Only for an attempt that would
+   otherwise be accepted and changed a source (non-test) file:
+   - **Baseline** (once per run): the attempt is stashed (`git stash -u`), the full
+     suite runs at HEAD (`PytestRunner.run_all`, pytest's own config decides what is
+     collected, plus `regression_pytest_args`, timeout `regression_timeout_seconds`),
+     then the attempt is restored (`stash pop --index`, always, even if the run fails).
+   - The full suite runs again with the attempt applied. **Regressions** = tests that
+     PASSED in the baseline and now fail, error or are missing (requested tests are
+     judged by verify as before). They are re-run once; those that pass are treated as
+     flaky. Any left → rollback and reject (`broke other tests in the full suite: a, b,
+     … and N more`), a failed attempt whose reason goes to the next one. If none, the
+     attempt is accepted and its full-suite results become the new baseline.
+   - The reason lists ids now failing, then `; no longer collected: ...` (up to 10 each).
+     The flaky re-run uses the same `regression_pytest_args`/timeout.
+   - If a full run (baseline or with the fix) cannot complete (e.g. timeout), a WARNING
+     is logged, regression checks are skipped for the rest of the run, the attempt is
+     judged on the normal rules (no attempt is burnt on a slow suite) and
+     `FixResult.warnings` gets `regression check skipped: ...`.
+   - **Restoring the attempt after the baseline:** before the pop, tracked files are
+     reset to HEAD and files the run created at the attempt's new paths are deleted
+     (the run's other new files are excluded as artifacts). If the pop still fails, or
+     the restored changed-file list differs from the one before the stash, the tree is
+     reset to HEAD, the stash dropped and the attempt rejected (`could not restore the
+     attempt after the baseline run: ...`, counts as an attempt). Checkpoint commits are
+     never touched.
+   - *Accepted limitations:* requested tests run twice for a source change (verify +
+     full run), for simplicity. Tests in a file that already failed to import in the
+     baseline have no individual baseline status, so they are not guarded one by one.
+   - **Pre-existing failures:** tests outside the requested ones that fail in the
+     latest baseline are returned in `FixResult.preexisting_failures` (slice 8 lists
+     them in the PR description). Full-run artifacts are excluded like verify's.
 6. **finalize** — The diff against the PR head contains **only accepted fixes**
    (the checkpoint commits). Slice 8 squashes the checkpoints into one commit with
    a descriptive message, pushes the branch, opens the PR and returns `FixResult`.
@@ -249,7 +278,8 @@ fill in the values. Secrets come from the environment:
 - `GITHUB_TOKEN` (needs repo + pull request write access)
 
 Configurable: model name, temperature, max attempts, parallel worker count,
-workspace directory, pytest extra arguments, regression test command.
+workspace directory, pytest extra arguments, full-suite (regression) pytest arguments
+and timeout.
 
 ---
 
@@ -282,7 +312,7 @@ tests/
 | 3 | LangGraph skeleton with a stub fixer: state, retry loop, 3-attempt limit | Loop and exit paths tested |
 | 4 | Claude fixer agent (sequential), temperature 0 | Fixes seeded bugs in the sample repo |
 | 5 | Patch checker + UNFIXABLE reporting | Rejects every forbidden pattern |
-| 6 | Conditional regression run (only on source changes) | Runs only when source changed |
+| 6 | Conditional regression run (only on source changes): baseline, full run per attempt, flaky re-run, pre-existing failures | Runs only when source changed; a new full-suite failure rejects the attempt |
 | 7 | Parallel fixing (worktrees + `Send`) | Same results as sequential |
 | 8 | Finalize: commit, summary, push, open PR | PR description meets the 2–3 min bar |
 | 9 | End-to-end run on the sample repo | Full pipeline passes |
