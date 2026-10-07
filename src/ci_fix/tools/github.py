@@ -59,6 +59,7 @@ class PullRequestInfo(BaseModel, frozen=True):
     # Needed to push a fix to a fork PR's branch (allowed only if maintainer_can_modify).
     head_clone_url: str | None = None
     maintainer_can_modify: bool = False
+    body: str = ""
 
 
 class GitHubClient:
@@ -88,6 +89,7 @@ class GitHubClient:
                 html_url=pr.html_url,
                 head_clone_url=head_repo.clone_url if head_repo is not None else None,
                 maintainer_can_modify=pr.maintainer_can_modify is True,
+                body=pr.body if isinstance(pr.body, str) else "",
             )
         except GithubException as exc:
             if exc.status == 404:

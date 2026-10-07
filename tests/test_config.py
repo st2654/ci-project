@@ -48,7 +48,7 @@ def test_package_exports_config_api() -> None:
 
 def test_settings_defaults() -> None:
     s = Settings()
-    assert s.model == "claude-sonnet-5-5"
+    assert s.model == "claude-sonnet-4-6"
     assert s.temperature == 0.0
     assert s.max_attempts == 3
     assert s.max_parallel_workers == 4
@@ -338,3 +338,12 @@ def test_empty_string_fields_rejected(tmp_path: Path, field: str) -> None:
     cfg.write_text(f'[ci_fix]\n{field} = ""\n')
     with pytest.raises(ConfigError):
         load_settings(cfg, env={})
+
+
+@pytest.mark.parametrize("value", ["default", "none", "DEFAULT", ""])
+def test_temperature_default_means_not_sent(tmp_path: Path, value: str) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[ci_fix]\nmodel = "claude-sonnet-5-5"\ntemperature = "{value}"\n')
+    s = load_settings(cfg, env={})
+    assert s.temperature is None
+    assert s.model == "claude-sonnet-5-5"

@@ -37,6 +37,8 @@ class PreparedRepo(BaseModel):
     pr: PullRequestInfo
     branch: str
     pr_head_sha: str
+    # Merge-base of the base branch tip and the PR head; None if the base could not be fetched.
+    base_sha: str | None = None
 
     @property
     def venv_dir(self) -> Path:
@@ -99,6 +101,7 @@ def prepare_pr_checkout(
         if sha != pr.head_sha:
             raise GitError(f"PR head moved: API says {pr.head_sha}, fetched {sha} — retry")
         log.info("[setup 3/4] PR head is %s", sha[:12])
+        base_sha = _fetch_base_sha(repo, pr.base_ref, sha, token)
 
         log.info("[setup 4/4] Creating patch branch %s", branch)
         repo.create_branch(branch, sha)
@@ -108,7 +111,30 @@ def prepare_pr_checkout(
         shutil.rmtree(_require_inside_workspace(run_dir, settings), ignore_errors=True)
         raise
     log.info("Workspace ready at %s (%.1fs)", dest, time.monotonic() - started)
-    return PreparedRepo(run_dir=run_dir, path=dest, repo=ref, pr=pr, branch=branch, pr_head_sha=sha)
+    return PreparedRepo(
+        run_dir=run_dir,
+        path=dest,
+        repo=ref,
+        pr=pr,
+        branch=branch,
+        pr_head_sha=sha,
+        base_sha=base_sha,
+    )
+
+
+def _fetch_base_sha(repo: GitRepo, base_ref: str, head_sha: str, token: str | None) -> str | None:
+    """Merge-base of ``base_ref`` and the PR head (what the PR changed is ``base..head``).
+
+    Only used to show the fixer the PR diff, so a failure is a warning, not fatal.
+    """
+    try:
+        base_tip = repo.fetch_base(base_ref, token=token)
+        base_sha = repo.merge_base(base_tip, head_sha)
+    except GitError as exc:
+        log.warning("Could not determine the PR base (%s); the fixer gets no PR diff", exc)
+        return None
+    log.debug("PR base (merge-base with %s) is %s", base_ref, base_sha[:12])
+    return base_sha
 
 
 def cleanup_workspace(prepared: PreparedRepo, settings: Settings) -> None:

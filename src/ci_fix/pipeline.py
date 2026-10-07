@@ -6,10 +6,11 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from ci_fix.agent import ClaudeFixer
 from ci_fix.config import Settings, load_settings
 from ci_fix.graph import PipelineDeps, PipelineState, RunContext, build_graph, recursion_limit
 from ci_fix.logging_setup import get_logger
-from ci_fix.models import Fixer, FixResult, NoOpFixer, OutcomeStatus, TestOutcome
+from ci_fix.models import Fixer, FixResult, OutcomeStatus, TestOutcome
 from ci_fix.tools.github import GitHubClient, parse_repo_url
 from ci_fix.workspace import cleanup_workspace
 
@@ -45,9 +46,9 @@ def fix_failing_tests(
         if github is None:
             token = settings.github_token.get_secret_value() if settings.github_token else None
             github = GitHubClient(token)
-        deps = PipelineDeps(
-            settings=settings, github=github, fixer=fixer if fixer is not None else NoOpFixer()
-        )
+        if fixer is None:
+            fixer = ClaudeFixer(settings)  # raises ConfigError without ANTHROPIC_API_KEY
+        deps = PipelineDeps(settings=settings, github=github, fixer=fixer)
     settings = deps.settings
 
     ref = parse_repo_url(repo_url)

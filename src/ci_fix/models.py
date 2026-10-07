@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from ci_fix.tools.pytest_runner import TestResult
 
 
 class OutcomeStatus(StrEnum):
@@ -48,6 +51,8 @@ class FixAttempt(BaseModel):
 class FixRequest(BaseModel):
     """Everything a fixer needs to attempt a fix for one failing test."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     node_id: str
     repo_path: Path
     attempt: int  # 1-based
@@ -55,12 +60,27 @@ class FixRequest(BaseModel):
     failure_message: str
     failure_details: str
     previous_attempts: list[FixAttempt] = Field(default_factory=list)
+    pr_title: str = ""
+    pr_body: str = ""
+    # Diff of what the PR changed (merge-base..PR head), truncated; "" if unknown.
+    pr_diff: str = ""
+    # Other requested tests that are still failing (they may share the root cause).
+    other_failing_tests: list[str] = Field(default_factory=list)
+    # Runs the target test (only) and returns its result; set by the pipeline.
+    run_test: Callable[[str], TestResult] | None = Field(default=None, exclude=True, repr=False)
 
 
 class Fixer(Protocol):
     """Edits files under ``request.repo_path`` to make ``request.node_id`` pass."""
 
     def fix(self, request: FixRequest) -> FixAttempt: ...
+
+
+class FixerFatalError(Exception):
+    """A fixer error no retry can fix (bad API key, no credit, unsupported parameter).
+
+    The pipeline stops the whole run instead of counting it as a failed attempt.
+    """
 
 
 class NoOpFixer:

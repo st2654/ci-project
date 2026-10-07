@@ -21,8 +21,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ci_fix.config import Settings
 from ci_fix.logging_setup import get_logger
-from ci_fix.models import FixAttempt, Fixer, FixRequest, OutcomeStatus, TestOutcome
-from ci_fix.tools.git import GitRepo
+from ci_fix.models import (
+    FixAttempt,
+    Fixer,
+    FixerFatalError,
+    FixRequest,
+    OutcomeStatus,
+    TestOutcome,
+)
+from ci_fix.tools.git import GitError, GitRepo
 from ci_fix.tools.github import GitHubClient
 from ci_fix.tools.pytest_runner import (
     PytestRunner,
@@ -40,6 +47,7 @@ NOT_COLLECTED_REASON = "not collected by pytest"
 DELETED_REASON = "test no longer collected after fix — fixes must not delete or rename tests"
 SKIPPED_AFTER_FIX_REASON = "test skipped after fix — fixes must not skip tests"
 NO_CHANGES_REASON = "no changes made"
+ONLY_TARGET_REASON = "only the target test can be run"
 _FAILING = (TestStatus.FAILED, TestStatus.ERROR)
 
 
@@ -84,6 +92,7 @@ class RunContext:
 
     prepared: PreparedRepo | None = None
     runner: TestRunner | None = None
+    pr_diff: str | None = None  # cached, truncated PR diff for the fixer
 
     @property
     def repo(self) -> GitRepo:
@@ -223,6 +232,18 @@ def judge(target: str, before: dict[str, TestResult], after: dict[str, TestResul
     return verdict
 
 
+def truncate_text(text: str, max_chars: int) -> str:
+    """``text`` cut to at most ``max_chars`` (marker included) if it was longer.
+
+    The cut part is replaced by a ``[... truncated N chars]`` marker.
+    """
+    if len(text) <= max_chars:
+        return text
+    # The marker for the largest possible N is never shorter than the real one.
+    keep = max(0, max_chars - len(f"\n[... truncated {len(text)} chars]"))
+    return f"{text[:keep]}\n[... truncated {len(text) - keep} chars]"
+
+
 def build_summary(state: PipelineState) -> str:
     """Placeholder markdown summary: one line per requested test."""
     lines = [f"## ci-fix results for PR #{state.pr_number}", ""]
@@ -355,6 +376,35 @@ def build_graph(deps: PipelineDeps) -> Any:
         pending = [p for p in state.pending if p != nid]
         return {**update, "outcomes": outcomes, "pending": pending}
 
+    def pr_diff(prepared: PreparedRepo, ctx: RunContext) -> str:
+        """What the PR changed (merge-base..PR head), truncated; computed once per run."""
+        if ctx.pr_diff is None:
+            diff = ""
+            if prepared.base_sha:
+                try:
+                    diff = ctx.repo.diff_commits(prepared.base_sha, prepared.pr_head_sha)
+                except GitError as exc:
+                    log.warning("[fix] Could not compute the PR diff: %s", exc)
+            ctx.pr_diff = truncate_text(diff, settings.pr_diff_max_chars)
+        return ctx.pr_diff
+
+    def make_run_test(target: str, config: RunnableConfig) -> Callable[[str], TestResult]:
+        repo = _ctx(config).repo
+
+        def run_test(node_id: str) -> TestResult:
+            if node_id != target:
+                return TestResult(
+                    node_id=node_id, status=TestStatus.NOT_FOUND, message=ONLY_TARGET_REASON
+                )
+            untracked_before = repo.untracked_files()
+            try:
+                return run_tests([node_id], config)[node_id]
+            finally:
+                # Files the test run created are artifacts, not fixer changes.
+                repo.exclude(repo.untracked_files() - untracked_before)
+
+        return run_test
+
     def fix_one(state: PipelineState, config: RunnableConfig) -> dict[str, Any]:
         assert state.prepared is not None and state.current is not None
         nid = state.current
@@ -371,11 +421,20 @@ def build_graph(deps: PipelineDeps) -> Any:
             failure_message=failure.message if failure else "",
             failure_details=failure.details if failure else "",
             previous_attempts=list(previous),
+            pr_title=state.prepared.pr.title,
+            pr_body=state.prepared.pr.body,
+            pr_diff=pr_diff(state.prepared, _ctx(config)),
+            other_failing_tests=[p for p in state.pending if p != nid],
+            run_test=make_run_test(nid, config),
         )
         started = time.monotonic()
         update: dict[str, Any] = {"attempts": {**state.attempts, nid: n}}
         try:
             attempt = deps.fixer.fix(request)
+        except FixerFatalError as exc:
+            repo.rollback()
+            log.error("[fix] stopping the run: %s", exc)
+            raise
         except Exception as exc:  # a fixer bug must not crash the whole run
             log.error("[fix] fixer raised for %s: %s", nid, exc, exc_info=True)
             repo.rollback()  # drop any partial edits

@@ -150,6 +150,19 @@ class GitRepo:
         log.debug("Fetched PR #%d at %s", pr_number, sha[:12])
         return sha
 
+    def fetch_base(self, base_ref: str, token: str | None = None) -> str:
+        """Fetch ``base_ref`` from origin into ``refs/ci-fix-fetch/base``; return its SHA."""
+        ref = "refs/ci-fix-fetch/base"
+        log.debug("Fetching base branch %s from origin", base_ref)
+        self._git("fetch", "origin", f"+refs/heads/{base_ref}:{ref}", token=token)
+        sha = self._git("rev-parse", ref)
+        log.debug("Fetched base %s at %s", base_ref, sha[:12])
+        return sha
+
+    def merge_base(self, a: str, b: str) -> str:
+        """The best common ancestor of commits ``a`` and ``b``."""
+        return self._git("merge-base", a, b)
+
     def create_branch(self, name: str, start_point: str) -> None:
         self._git("checkout", "-b", name, start_point)
         log.debug("Created branch %s at %s", name, start_point[:12])
@@ -173,6 +186,10 @@ class GitRepo:
         """
         self._git("add", "--all", "--intent-to-add")
         return self._git("diff", base)
+
+    def diff_commits(self, a: str, b: str) -> str:
+        """Diff between two commits (``git diff a b``); the working tree is not involved."""
+        return self._git("diff", a, b)
 
     def changed_files(self) -> list[str]:
         """Sorted paths that differ between the working tree and HEAD (new, modified, deleted).

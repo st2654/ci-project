@@ -6,8 +6,11 @@
 
 [ci_fix]
 # Anthropic model used by the fixer agent.
-model = "claude-sonnet-5-5"
-# Sampling temperature for the model (0.0 to 1.0).
+model = "claude-sonnet-4-6"
+# Sampling temperature (0.0 to 1.0); 0.0 = as deterministic as possible.
+# Newer models (claude-sonnet-5-5, claude-opus-5-5) reject temperature: use
+#   model = "claude-sonnet-5-5"
+#   temperature = "default"     # don't send a temperature
 temperature = 0.0
 # Fix -> re-test rounds per failing test before it is reported as unfixable.
 max_attempts = 3
@@ -30,6 +33,14 @@ python_version = "3.11"
 test_timeout_seconds = 900
 # Keep the run directory (clone, venv, JUnit reports) after the run, for debugging.
 keep_workspace = false
+# Fixer agent: maximum model turns (tool-call rounds) per fix attempt.
+max_agent_steps = 30
+# Fixer agent: maximum tokens the model may generate per turn.
+max_output_tokens = 4096
+# Fixer agent: the PR diff shown to the model is truncated to this many characters.
+pr_diff_max_chars = 40000
+# Fixer agent: maximum lines returned by one read_file call.
+read_max_lines = 400
 # Console log level: DEBUG, INFO, WARNING or ERROR. INFO shows pipeline progress.
 log_level = "INFO"
 # Optional file that receives full DEBUG logs for troubleshooting (~ is expanded).

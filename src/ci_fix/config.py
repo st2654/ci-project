@@ -27,8 +27,10 @@ class Settings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    model: str = Field(default="claude-sonnet-5-5", min_length=1)
-    temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+    model: str = Field(default="claude-sonnet-4-6", min_length=1)
+    # None = don't send a temperature (use the model's default). Newer models such as
+    # claude-sonnet-5-5 reject `temperature`; set it to "default" in config.toml for them.
+    temperature: float | None = Field(default=0.0, ge=0.0, le=1.0)
     max_attempts: int = Field(default=3, ge=1)
     max_parallel_workers: int = Field(default=4, ge=1)
     workspace_dir: Path = Field(default=Path("~/.ci-fix/workspaces"), validate_default=True)
@@ -41,8 +43,19 @@ class Settings(BaseModel):
     install_command: list[str] | None = None
     test_timeout_seconds: int = Field(default=900, ge=1)
     keep_workspace: bool = False
+    max_agent_steps: int = Field(default=30, ge=1)
+    max_output_tokens: int = Field(default=4096, ge=256)
+    pr_diff_max_chars: int = Field(default=40000, ge=1000)
+    read_max_lines: int = Field(default=400, ge=50)
     anthropic_api_key: SecretStr | None = None
     github_token: SecretStr | None = None
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _default_temperature(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip().lower() in {"default", "none", ""}:
+            return None
+        return value
 
     @field_validator("workspace_dir", "log_file", mode="after")
     @classmethod

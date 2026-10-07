@@ -30,7 +30,7 @@ opens a PR with a concise, human-readable description.
 | Language | Python 3.11+ |
 | Package manager | `uv` |
 | Orchestration | LangGraph (`StateGraph`) |
-| LLM | Anthropic `claude-sonnet-5-5`, **temperature 0** (configurable) |
+| LLM | Anthropic `claude-sonnet-4-6`, **temperature 0** (both configurable). Newer models (`claude-sonnet-5-5`, `claude-opus-5-5`) reject `temperature`; for them set `temperature = "default"` so it isn't sent. Fatal API errors (400/401/403/404: bad key, no credit, unsupported parameter) stop the run instead of using up attempts. |
 | Target test framework | **pytest only** (v1). Keep the runner behind an interface so others can be added later. |
 | What a fix may change | Test files **and** source code. A source change must fix the real bug, never special-case the test (see "Integrity rules"). |
 | Delivery | Push patch branch `ci-fix/pr-<N>` and **open a PR targeting the original PR's branch** (the fix layers on top of that PR) |

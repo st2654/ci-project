@@ -9,7 +9,7 @@ from pathlib import Path
 from ci_fix import __version__
 from ci_fix.config import ConfigError, load_settings
 from ci_fix.logging_setup import configure_logging, get_logger
-from ci_fix.models import OutcomeStatus
+from ci_fix.models import FixerFatalError, OutcomeStatus
 from ci_fix.pipeline import fix_failing_tests
 from ci_fix.tools.git import GitError
 from ci_fix.tools.github import GitHubError
@@ -21,7 +21,7 @@ EXIT_NOT_ALL_FIXED = 1
 EXIT_ERROR = 2
 EXIT_INTERRUPTED = 130  # shell convention: 128 + SIGINT
 _SUCCESS = (OutcomeStatus.FIXED, OutcomeStatus.ALREADY_PASSING)
-_ERRORS = (ConfigError, GitError, GitHubError, TestEnvError, TestRunError)
+_ERRORS = (ConfigError, GitError, GitHubError, TestEnvError, TestRunError, FixerFatalError)
 
 log = get_logger(__name__)
 

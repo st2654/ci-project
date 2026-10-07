@@ -741,3 +741,19 @@ def test_concurrent_runs_on_same_pr_use_separate_workspaces(
     repo_paths = {r.repo_path for r in runners.runners}
     assert len(repo_paths) == 2  # two separate workspaces
     assert run_dirs_for(tmp_path) == []  # both cleaned up
+
+
+def test_fatal_fixer_error_stops_run_without_burning_attempts(run, tmp_path: Path) -> None:
+    from ci_fix.models import FixerFatalError
+
+    class _Fatal:
+        calls = 0
+
+        def fix(self, request):
+            _Fatal.calls += 1
+            raise FixerFatalError("Claude API rejected the request: credit balance is too low")
+
+    with pytest.raises(FixerFatalError, match="credit balance"):
+        run(_Fatal(), [SUBTRACT, DIV_ZERO], max_attempts=3)
+    assert _Fatal.calls == 1  # no further attempts, no other tests tried
+    assert run_dirs_for(tmp_path) == []  # workspace still cleaned up
